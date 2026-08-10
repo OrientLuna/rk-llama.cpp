@@ -4,7 +4,9 @@
 
 **简体中文** | [English](./README.en.md)
 
-[rk-llama.cpp](https://github.com/invisiofficial/rk-llama.cpp) 的一个分支（后者本身是 [llama.cpp](https://github.com/ggml-org/llama.cpp) 的分支），在 `llama-server` 中新增了**瑞芯微 RKLLM 进程内后端**与**多模态视觉支持**，面向 RK3588 等瑞芯微 NPU。
+本项目是[rk-llama.cpp](https://github.com/invisiofficial/rk-llama.cpp) 的分支，希望使用一套运行时,同时提供对*.rkllm以及*.gguf格式的模型兼容，前者提供更好的NPU推理优化，后者提供更快的模型适配节奏，技术上没有任何创新性。仓库主要依靠vibe-coding完成，所以有些文档不太说人话，后续作者会逐步完善，也欢迎各位交流。
+
+> 注：`rk-llama.cpp`本身是 [llama.cpp](https://github.com/ggml-org/llama.cpp) 的分支），在 `llama-server` 中新增了**瑞芯微 RKLLM 进程内后端**与**多模态视觉支持**，面向 RK3588 等瑞芯微 NPU。
 
 > 本 README 仅介绍本分支新增的内容（RKLLM 后端 + 多模态通路）。关于上游的 Rockchip NPU GGML 后端（对 `.gguf` 模型做混合量化），请参阅 [ggml/src/ggml-rknpu2/README.md](./ggml/src/ggml-rknpu2/README.md)。
 
@@ -13,12 +15,12 @@
 | | |
 |---|---|
 | **SoC** | 瑞芯微 **RK3588**（4× Cortex-A76 + 4× Cortex-A55，3 个 NPU 核心），`aarch64` |
-| **操作系统** | Ubuntu 22.04（Forlinx / 厂商出厂镜像） |
+| **操作系统** | Ubuntu 22.04（基于Forlinx飞凌嵌入式提供的镜像修改） |
 | **编译** | 板上原生编译，`gcc/g++ 11.4`、`cmake 3.22` |
 | **RKNN 驱动** | `0.9.6+`（NPU 运行时 `librknnrt.so`） |
 | **RKLLM 运行时** | `1.2.3`（`librkllmrt.so`） |
 
-其它瑞芯微 SoC（如 RK3576）及其它 RKNN/RKLLM 版本**尚未验证**——见 TODO。对应的运行时库已内置在 `ggml/src/ggml-rknpu2/libs/`；若板子的 NPU 内核驱动版本不同，请用瑞芯微官方发布包中与驱动匹配的那两个 `.so` 文件替换。
+其它瑞芯微 SoC（如 RK3576）及其它 RKNN/RKLLM 版本**尚未验证**（见 TODO）。对应的运行时库已内置在 `ggml/src/ggml-rknpu2/libs/`；其他版本的动态库请到瑞芯微官方仓库获取。
 
 ### 已测试模型
 
@@ -26,10 +28,42 @@
 
 | 模型 | 文件 | 后端 | 多模态 | 备注 |
 |---|---|---|---|---|
-| **Qwen3-VL 2B Instruct** | `qwen3-vl-2b-instruct_w8a8_rk3588.rkllm`（2.3 GB）+ `qwen3-vl-2b_vision_rk3588.rknn`（812 MB） | `rkllm` | ✅ 视觉 | W8A8 量化；进程内后端 |
-| **Qwen3.5 0.8B** | `Qwen3.5-0.8B-Q4_K_M.gguf`（508 MB）+ `mmproj-Qwen3.5-0.8B-F16.gguf`（196 MB） | `llama`（NPU） | ✅ 投影器 | Q4_K_M；经 `ggml-rknpu2` 在 NPU 上运行，约 21 tok/s |
+| **Qwen3-VL 2B Instruct** | `qwen3-vl-2b-instruct_w8a8_rk3588.rkllm`（2.3 GB）+ `qwen3-vl-2b_vision_rk3588.rknn`（812 MB） | `rkllm` | ✅ 支持 | W8A8 量化；进程内后端 |
+| **Qwen3.5 0.8B** | `Qwen3.5-0.8B-Q4_K_M.gguf`（508 MB）+ `mmproj-Qwen3.5-0.8B-F16.gguf`（196 MB） | `llama`（NPU） | ✅ 支持 | Q4_K_M；经 `ggml-rknpu2` 在 NPU 上运行，约 21 tok/s |
 
-已验证的流程：冷启动加载、模型切换（卸载→加载）、聊天补全（文本/中文/算术），以及 router API（`/models/load`、`/v1/chat/completions`）。更多模型将在验证后补充——更广泛的覆盖见 TODO。
+已验证的流程：冷启动加载、模型切换（卸载→加载）、聊天补全，以及 router API（`/models/load`、`/v1/chat/completions`）。更多模型将在验证后补充（见 TODO）。
+
+---
+
+## 快速开始
+
+不想看长篇说明？五步跑起来（假设你已在 RK3588 上，且模型文件已就位）：
+
+```sh
+# 1. 编译（约 5 分钟）
+cd rk-llama.cpp && mkdir build && cd build
+cmake .. -DLLAMA_RKNPU2=ON && make -j$(nproc) llama-server
+
+# 2. 从模板创建你的模型配置，把 model/mmproj 路径改成你的实际文件
+cd ..
+cp deploy/models.ini.example deploy/models.ini
+#   编辑 deploy/models.ini，至少改一个 [section] 里的 model 路径
+
+# 3. 调高文件描述符上限
+ulimit -n 65536
+
+# 4. 启动服务（把 <your-model-id> 换成 models.ini 里的小节名）
+./build/bin/llama-server --models-preset deploy/models.ini \
+    --default-model <your-model-id> --models-max 1 \
+    --host 0.0.0.0 --port 8080 -c 2048
+
+# 5. 测试一下
+curl -s http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"你好"}]}' 
+```
+
+跑通了？后续可看下面的 [运行](#运行) 和 [部署](#部署) 章节做更细的配置（多模型、开机自启等）。卡住了？看 [故障排查](#故障排查)。
 
 ---
 
@@ -54,7 +88,7 @@
 
 ## 编译
 
-> 请**在瑞芯微板子上原生编译**（如 RK3588）。目标是 `aarch64`——除非你有匹配的工具链和 sysroot，否则不要从 x86 交叉编译。
+> 建议**在瑞芯微板子上原生编译**（如 RK3588）。目标是 `aarch64`——除非你有匹配的工具链和 sysroot，否则不要从 x86 交叉编译。（如果你是这方面的专家可以自行尝试）
 
 ### 前置依赖
 
@@ -64,7 +98,9 @@
 sudo apt-get install -y build-essential cmake git
 ```
 
-瑞芯微的 **RKNN 运行时**（`librknnrt.so`）与 **RKLLM 运行时**（`librkllmrt.so`）及 SDK 头文件已**内置**在 `ggml/src/ggml-rknpu2/libs/` 下，无需额外下载。这两个是瑞芯微的专有 NPU 运行时（见 [NOTICE.md](./NOTICE.md)）；瑞芯微**不**提供 GGUF 后端——`.gguf` 在 NPU 上运行的能力由本仓库的 `ggml-rknpu2` 后端实现，它调用 `librknnrt.so`。`llama-server` 会直接链接这两个运行时，因此运行时加载器必须能找到它们（见下方故障排查）。
+瑞芯微的 **RKNN 运行时**（`librknnrt.so`）与 **RKLLM 运行时**（`librkllmrt.so`）及 SDK 头文件已**内置**在 `ggml/src/ggml-rknpu2/libs/` 下，无需额外下载。这两个是瑞芯微的专有 NPU 运行时（见 [NOTICE.md](./NOTICE.md)）；瑞芯微**不**提供 GGUF 后端——`.gguf` 在 NPU 上运行的能力由本仓库的 `ggml-rknpu2` 后端实现，它调用 `librknnrt.so`。`llama-server` 会直接链接这两个运行时，因此运行时加载器必须能找到它们（见下方故障排查）
+
+> 另外，这块表述是AI写的，我感觉好像不太对，但是反正目前还能用就先不管了）。
 
 ### 配置与编译
 

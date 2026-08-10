@@ -4,21 +4,23 @@
 
 [简体中文](./README.md) | **English**
 
-A fork of [rk-llama.cpp](https://github.com/invisiofficial/rk-llama.cpp) (itself a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp)) that adds a **Rockchip RKLLM in-process backend** and **multimodal vision support** to `llama-server`, targeting Rockchip NPUs such as the **RK3588**.
+A fork of [rk-llama.cpp](https://github.com/invisiofficial/rk-llama.cpp) that aims to support both `*.rkllm` and `*.gguf` models under a single runtime — the former offers better NPU inference optimization, the latter a faster model-adaptation pace. There is nothing technically novel here. The repo is mostly the product of vibe-coding, so some of the docs may not read like a human wrote them; the author will keep refining them, and discussion is welcome.
 
-> This README covers the fork's additions (the RKLLM backend + multimodal path). For the upstream Rockchip NPU GGML backend (hybrid quantization on `.gguf` models), see [ggml/src/ggml-rknpu2/README.md](./ggml/src/ggml-rknpu2/README.md).
+> Note: `rk-llama.cpp` is itself a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp). This fork adds a **Rockchip RKLLM in-process backend** and **multimodal vision support** to `llama-server`, targeting Rockchip NPUs such as the **RK3588**.
+
+> This README covers only the additions in this fork (the RKLLM backend + multimodal path). For the upstream Rockchip NPU GGML backend (hybrid quantization on `.gguf` models), see [ggml/src/ggml-rknpu2/README.md](./ggml/src/ggml-rknpu2/README.md).
 
 ### Tested environment
 
 | | |
 |---|---|
 | **SoC** | Rockchip **RK3588** (4× Cortex-A76 + 4× Cortex-A55, 3 NPU cores), `aarch64` |
-| **OS** | Ubuntu 22.04 (stock Forlinx / vendor image) |
+| **OS** | Ubuntu 22.04 (modified from the image by Forlinx) |
 | **Build** | Native on-device with `gcc/g++ 11.4`, `cmake 3.22` |
 | **RKNN driver** | `0.9.6+` (NPU runtime `librknnrt.so`) |
 | **RKLLM runtime** | `1.2.3` (`librkllmrt.so`) |
 
-Other Rockchip SoCs (e.g. RK3576) and other RKNN/RKLLM versions are **not yet verified** — see the TODO section. The matching runtime libraries are vendored under `ggml/src/ggml-rknpu2/libs/`; if your board runs a different NPU kernel driver, swap those two `.so` files for driver-matched ones from Rockchip's release archives.
+Other Rockchip SoCs (e.g. RK3576) and other RKNN/RKLLM versions are **not yet verified** (see TODO). The runtime libraries are vendored under `ggml/src/ggml-rknpu2/libs/`; for other versions, get the dynamic libraries from Rockchip's official repository.
 
 ### Tested models
 
@@ -30,6 +32,38 @@ The following model files have been verified to load and run on the tested envir
 | **Qwen3.5 0.8B** | `Qwen3.5-0.8B-Q4_K_M.gguf` (508 MB) + `mmproj-Qwen3.5-0.8B-F16.gguf` (196 MB) | `llama` (NPU) | ✅ projector | Q4_K_M; runs on the NPU via `ggml-rknpu2`, ~21 tok/s |
 
 Tested flows: cold load, model switch (unload → load), chat completion (text + Chinese + arithmetic), and the router API (`/models/load`, `/v1/chat/completions`). More models will be added as they are validated — broader coverage is tracked in the TODO section.
+
+---
+
+## Quick start
+
+Don't want to read the whole thing? Five steps to get running (assuming you're on an RK3588 and your model files are in place):
+
+```sh
+# 1. Build (~5 min)
+cd rk-llama.cpp && mkdir build && cd build
+cmake .. -DLLAMA_RKNPU2=ON && make -j$(nproc) llama-server
+
+# 2. Create your model config from the template, point model/mmproj at your files
+cd ..
+cp deploy/models.ini.example deploy/models.ini
+#   edit deploy/models.ini — at minimum fix the model path in one [section]
+
+# 3. Raise the file-descriptor limit
+ulimit -n 65536
+
+# 4. Start the server (replace <your-model-id> with the section name from models.ini)
+./build/bin/llama-server --models-preset deploy/models.ini \
+    --default-model <your-model-id> --models-max 1 \
+    --host 0.0.0.0 --port 8080 -c 2048
+
+# 5. Test it
+curl -s http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Hello"}]}'
+```
+
+Works? For finer configuration (multiple models, autostart on boot, etc.), see the [Run](#run) and [Deployment](#deployment) sections below. Stuck? See [Troubleshooting](#troubleshooting).
 
 ---
 
@@ -54,7 +88,7 @@ The original `.gguf` + NPU path still works (see the backend README linked above
 
 ## Build
 
-> Build **natively on the Rockchip device** (e.g. RK3588). It is an `aarch64` target — do not cross-compile from x86 unless you have a matching toolchain and sysroot.
+> Build **natively on the Rockchip device** (e.g. RK3588). The target is `aarch64` — don't cross-compile from x86 unless you have a matching toolchain and sysroot. (If you're an expert at this, feel free to try.)
 
 ### Prerequisites
 
@@ -65,6 +99,8 @@ sudo apt-get install -y build-essential cmake git
 ```
 
 The Rockchip **RKNN runtime** (`librknnrt.so`) and **RKLLM runtime** (`librkllmrt.so`), plus their SDK headers, are **vendored** under `ggml/src/ggml-rknpu2/libs/` — no download step is needed. These are Rockchip's proprietary NPU runtimes (see [NOTICE.md](./NOTICE.md)); Rockchip does not provide a GGUF backend. The `.gguf`-on-NPU support is implemented by this repo's `ggml-rknpu2` backend, which calls into `librknnrt.so`. `llama-server` links both runtimes directly, so at runtime the loader must find them (see Troubleshooting below).
+
+> (This paragraph was written by AI; it may not be entirely accurate, but it works for now, so I'm leaving it.)
 
 ### Configure and compile
 
