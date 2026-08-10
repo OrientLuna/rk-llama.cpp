@@ -1,0 +1,24 @@
+[Unit]
+Description=rk-llama.cpp - llama-server (Rockchip NPU accelerated inference)
+Documentation=https://github.com/ggml-org/llama.cpp
+After=network.target
+
+# NOTE: replace <your-user> and /opt/rk-llama.cpp with your actual user and
+# checkout path before enabling this unit.
+[Service]
+Type=simple
+User=<your-user>
+Group=<your-user>
+WorkingDirectory=/opt/rk-llama.cpp
+Environment=LD_LIBRARY_PATH=/opt/rk-llama.cpp/ggml/src/ggml-rknpu2/libs
+ExecStart=/opt/rk-llama.cpp/build/bin/llama-server \
+    --models-preset /opt/rk-llama.cpp/deploy/models.ini \
+    --default-model <model-id> \
+    --models-max 1 \
+    --host 0.0.0.0 --port 8080 -c 2048 --reasoning off
+Restart=on-failure
+RestartSec=15
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

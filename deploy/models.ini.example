@@ -1,0 +1,33 @@
+version = 1
+
+# Default options applied to every model section below.
+[*]
+c = 2048
+jinja = true
+reasoning = off
+
+# --- GGUF backbone (run via the standard llama.cpp / ggml-rknpu2 path) ---
+# The section name in [brackets] becomes the model's ID in the API. Name it
+# whatever you like. Paths are relative to the launch directory, or absolute.
+[my-gguf-model]
+model = models/your-llm-Q4_K_M.gguf
+mmproj = models/mmproj-your-llm-F16.gguf
+
+# Set load-on-startup = true to preload a model when the server starts.
+# This is independent of --no-models-autoload (which only blocks on-demand
+# loading of unrequested models).
+# load-on-startup = true
+
+# --- RKLLM in-process backend (native .rkllm model + RKNN vision encoder) ---
+# Set `backend = rkllm` to load the model in-process via librkllmrt.so (no
+# subprocess). `mmproj` points at the .rknn vision encoder for multimodal input.
+[my-rkllm-model]
+backend = rkllm
+model = models/your-llm-w4a16.rkllm
+mmproj = models/your-vision-encoder.rknn
+c = 2048
+
+# --- Making a model the default for requests that omit "model": ---
+# Any section name works. At startup, pass --default-model <section-name>
+# (or env LLAMA_ARG_DEFAULT_MODEL). Chat requests without a "model" field
+# then resolve to that model instead of returning an error.
