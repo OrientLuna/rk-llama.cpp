@@ -17,21 +17,45 @@ A fork of [rk-llama.cpp](https://github.com/invisiofficial/rk-llama.cpp) that ai
 | **SoC** | Rockchip **RK3588** (4× Cortex-A76 + 4× Cortex-A55, 3 NPU cores), `aarch64` |
 | **OS** | Ubuntu 22.04 (modified from the image by Forlinx) |
 | **Build** | Native on-device with `gcc/g++ 11.4`, `cmake 3.22` |
-| **RKNN driver** | `0.9.6+` (NPU runtime `librknnrt.so`) |
-| **RKLLM runtime** | `1.2.3` (`librkllmrt.so`) |
+| **RKNN driver** | `0.9.6+` / `0.9.8` (NPU runtime `librknnrt.so`; depends on the board's kernel driver) |
+| **RKLLM runtime** | `1.2.3` (vendored on `main`) and `1.3.0` (vendored on `runtime-1.3.0`) both verified |
 
-Other Rockchip SoCs (e.g. RK3576) and other RKNN/RKLLM versions are **not yet verified** (see TODO). The runtime libraries are vendored under `ggml/src/ggml-rknpu2/libs/`; for other versions, get the dynamic libraries from Rockchip's official repository.
+Other Rockchip SoCs (e.g. RK3576) are **not yet verified** (see TODO).
+
+#### RKLLM runtime version & branches
+
+`.rkllm` models are **version-locked** to the `rkllm-toolkit`/runtime that produced them: a model converted with toolkit 1.3.0 needs `librkllmrt.so` 1.3.0. This repo ships two branches, each with the matching header + `.so`:
+
+| Branch | Vendored `librkllmrt.so` | Header | For models |
+|---|---|---|---|
+| **`main`** (default) | `1.2.3` | 1.2.3 | `.rkllm` converted with toolkit 1.2.x |
+| **`runtime-1.3.0`** | `1.3.0` | 1.3.0 | `.rkllm` converted with toolkit 1.3.x (**backward compatible with 1.2.x models too**) |
+
+> Switch branches with `git checkout runtime-1.3.0`, then rebuild. You can also swap just the `.so` without changing branches via [`deploy/fetch-rkllm-runtime.sh`](./deploy/fetch-rkllm-runtime.sh) (see below).
 
 ### Tested models
 
-The following model files have been verified to load and run on the tested environment above. Both were converted for the RK3588 target (`rkllm-toolkit` for `.rkllm`, the standard toolchain for `.gguf`).
+The following model files have been verified to load and run on the tested environment above.
 
-| Model | File(s) | Backend | Multimodal | Notes |
-|---|---|---|---|---|
-| **Qwen3-VL 2B Instruct** | `qwen3-vl-2b-instruct_w8a8_rk3588.rkllm` (2.3 GB) + `qwen3-vl-2b_vision_rk3588.rknn` (812 MB) | `rkllm` | ✅ vision | W8A8 quant; in-process backend |
-| **Qwen3.5 0.8B** | `Qwen3.5-0.8B-Q4_K_M.gguf` (508 MB) + `mmproj-Qwen3.5-0.8B-F16.gguf` (196 MB) | `llama` (NPU) | ✅ projector | Q4_K_M; runs on the NPU via `ggml-rknpu2`, ~21 tok/s |
+**RKLLM backend** (`.rkllm` + `.rknn` vision encoder, `backend = rkllm`):
 
-Tested flows: cold load, model switch (unload → load), chat completion (text + Chinese + arithmetic), and the router API (`/models/load`, `/v1/chat/completions`). More models will be added as they are validated — broader coverage is tracked in the TODO section.
+| Model | File(s) | Multimodal | Notes |
+|---|---|---|---|
+| **Qwen3-VL 2B Instruct** | `qwen3-vl-2b-instruct_w8a8_rk3588.rkllm` (2.3 GB) + `qwen3-vl-2b_vision_rk3588.rknn` (812 MB) | ✅ | W8A8; toolkit 1.2.3 |
+| **Qwen3.5 0.8B** (VL) | `Qwen3.5-0.8B_w8a8_rk3588.rkllm` (1.3 GB) + `Qwen3.5-0.8B_vision_rk3588.rknn` (209 MB) | ✅ | W8A8; toolkit 1.3.0, requires the `runtime-1.3.0` branch |
+
+**GGUF / NPU backend** (standard quantized `.gguf`, runs on the NPU via `ggml-rknpu2`):
+
+| Model | Arch | File | Notes |
+|---|---|---|---|
+| **Qwen3.5 0.8B** | qwen3 | `Qwen3.5-0.8B-Q4_K_M.gguf` (508 MB) | Q4_K_M, ~21 tok/s |
+| **Qwen2.5 0.5B** | qwen2 | `qwen2.5-0.5b-instruct-q8_0.gguf` (645 MB) | Q8_0, loads in 4s |
+| **Gemma-3 1B** | gemma3 | `gemma-3-1b-it-Q8_0.gguf` (1020 MB) | Q8_0, loads in 10s |
+| **Llama-3.2 1B** | llama | `Llama-3.2-1B-Instruct-Q8_0.gguf` (1.3 GB) | Q8_0, loads in 11s |
+
+The GGUF backend is architecture-agnostic — any standard quantized `.gguf` works (the backend re-quantizes on the fly to native NPU pipelines W16A16/W8A8/W4A4). Four architectures verified: qwen2 / qwen3 / gemma3 / llama.
+
+Tested flows: cold load, model switch (unload → load), plain-text chat, multimodal image recognition, and the router API (`/models/load`, `/models/unload`, `/v1/chat/completions`). More models will be added as they are validated (see TODO).
 
 ---
 
@@ -134,7 +158,21 @@ ulimit -n 65536
 The two vendored `.so` files are Rockchip's proprietary NPU runtimes (see the Tested environment table above and [NOTICE.md](./NOTICE.md)):
 
 - `librknnrt.so` — the **RKNN runtime** (NPU compute). Called by this repo's `ggml-rknpu2` backend (which runs `.gguf` models on the NPU) **and** by the RKNN vision encoder. Rockchip does not ship a "GGUF backend"; that backend is code in this repo targeting the RKNN runtime.
-- `librkllmrt.so` — the **RKLLM runtime**, used by the in-process RKLLM backend to run native `.rkllm` models.
+- `librkllmrt.so` — the **RKLLM runtime**, used by the in-process RKLLM backend to run native `.rkllm` models. **Version-locked to the `.rkllm` model**: see "RKLLM runtime version & branches" above.
+
+**Switching the RKLLM runtime version** (when your `.rkllm` model needs a different version):
+
+```sh
+# Option 1: switch to the matching branch (main=1.2.3 / runtime-1.3.0=1.3.0) and rebuild
+git checkout runtime-1.3.0 && cd build && make -j$(nproc) llama-server
+
+# Option 2: download & swap just the .so without changing branches
+./deploy/fetch-rkllm-runtime.sh --list       # list available versions
+./deploy/fetch-rkllm-runtime.sh --current    # show the current version
+./deploy/fetch-rkllm-runtime.sh 1.3.0        # download & replace (auto-backup + verify)
+```
+
+> ⚠️ Switching across a major version (e.g. 1.2.3 ↔ 1.3.0) involves header ABI changes — you **must** switch to the matching branch and rebuild; swapping only the `.so` without the matching header will crash. Minor versions (e.g. 1.2.2 ↔ 1.2.3) generally allow a direct `.so` swap.
 
 ### Troubleshooting
 
@@ -337,7 +375,7 @@ This is an active edge-AI integration, not a finished product. Work in progress:
 
 - [ ] **Mixed RKNN vision encoder + GGUF LLM backbone** — the `tools/mtmd/rknn_encoder` path exists but needs integration testing so an RKNN encoder can feed a `.gguf` backbone (currently the encoder is wired to the RKLLM backbone only).
 - [ ] **Broader model support** — test more `.rkllm` LLM and `.rknn` vision-encoder combinations beyond the current Qwen / Gemma set.
-- [ ] **Driver / SDK version compatibility** — currently verified only on RKNN driver `0.9.6+` and RKLLM `1.2.3`. Test against older and newer RKNN / RKLLM releases and document the supported range.
+- [ ] **Driver / SDK version compatibility** — verified on RKNN driver `0.9.6+`/`0.9.8` and RKLLM runtime `1.2.3` & `1.3.0` (see the `runtime-1.3.0` branch). Older/newer versions still need testing.
 - [ ] **RK3576 configuration** — fill in the stubbed device config in `ggml/src/ggml-rknpu2/`.
 - [ ] **Tool / function-calling robustness** and streaming edge cases in the RKLLM backend.
 

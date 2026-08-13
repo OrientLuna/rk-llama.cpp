@@ -17,21 +17,45 @@
 | **SoC** | 瑞芯微 **RK3588**（4× Cortex-A76 + 4× Cortex-A55，3 个 NPU 核心），`aarch64` |
 | **操作系统** | Ubuntu 22.04（基于Forlinx飞凌嵌入式提供的镜像修改） |
 | **编译** | 板上原生编译，`gcc/g++ 11.4`、`cmake 3.22` |
-| **RKNN 驱动** | `0.9.6+`（NPU 运行时 `librknnrt.so`） |
-| **RKLLM 运行时** | `1.2.3`（`librkllmrt.so`） |
+| **RKNN 驱动** | `0.9.6+` / `0.9.8`（NPU 运行时 `librknnrt.so`，版本随板子内核驱动） |
+| **RKLLM 运行时** | `1.2.3`（`main` 分支内置）与 `1.3.0`（`runtime-1.3.0` 分支内置）均验证通过 |
 
-其它瑞芯微 SoC（如 RK3576）及其它 RKNN/RKLLM 版本**尚未验证**（见 TODO）。对应的运行时库已内置在 `ggml/src/ggml-rknpu2/libs/`；其他版本的动态库请到瑞芯微官方仓库获取。
+其它瑞芯微 SoC（如 RK3576）**尚未验证**（见 TODO）。
+
+#### RKLLM 运行时版本与分支
+
+`.rkllm` 模型与 `rkllm-toolkit`/运行时**版本锁定**：toolkit 1.3.0 转换的模型需要 `librkllmrt.so` 1.3.0。本仓库用两个分支分别内置对应版本的头文件与动态库：
+
+| 分支 | 内置 `librkllmrt.so` | 头文件 | 适用模型 |
+|---|---|---|---|
+| **`main`**（默认） | `1.2.3` | 1.2.3 | toolkit 1.2.x 转换的 `.rkllm` |
+| **`runtime-1.3.0`** | `1.3.0` | 1.3.0 | toolkit 1.3.x 转换的 `.rkllm`（**同时向后兼容 1.2.x 模型**） |
+
+> 切换分支：`git checkout runtime-1.3.0`，然后重新编译。也可用 [`deploy/fetch-rkllm-runtime.sh`](./deploy/fetch-rkllm-runtime.sh) 单独替换 `.so` 而不切分支（见下文）。
 
 ### 已测试模型
 
-下列模型文件已在上述环境验证可正常加载和运行。两者均针对 RK3588 目标转换（`.rkllm` 用 `rkllm-toolkit`，`.gguf` 用标准工具链）。
+下列模型文件已在上述环境验证可正常加载和运行。
 
-| 模型 | 文件 | 后端 | 多模态 | 备注 |
-|---|---|---|---|---|
-| **Qwen3-VL 2B Instruct** | `qwen3-vl-2b-instruct_w8a8_rk3588.rkllm`（2.3 GB）+ `qwen3-vl-2b_vision_rk3588.rknn`（812 MB） | `rkllm` | ✅ 支持 | W8A8 量化；进程内后端 |
-| **Qwen3.5 0.8B** | `Qwen3.5-0.8B-Q4_K_M.gguf`（508 MB）+ `mmproj-Qwen3.5-0.8B-F16.gguf`（196 MB） | `llama`（NPU） | ✅ 支持 | Q4_K_M；经 `ggml-rknpu2` 在 NPU 上运行，约 21 tok/s |
+**RKLLM 后端**（`.rkllm` + `.rknn` 视觉编码器，`backend = rkllm`）：
 
-已验证的流程：冷启动加载、模型切换（卸载→加载）、聊天补全，以及 router API（`/models/load`、`/v1/chat/completions`）。更多模型将在验证后补充（见 TODO）。
+| 模型 | 文件 | 多模态 | 备注 |
+|---|---|---|---|
+| **Qwen3-VL 2B Instruct** | `qwen3-vl-2b-instruct_w8a8_rk3588.rkllm`（2.3 GB）+ `qwen3-vl-2b_vision_rk3588.rknn`（812 MB） | ✅ | W8A8；toolkit 1.2.3 |
+| **Qwen3.5 0.8B**（VL） | `Qwen3.5-0.8B_w8a8_rk3588.rkllm`（1.3 GB）+ `Qwen3.5-0.8B_vision_rk3588.rknn`（209 MB） | ✅ | W8A8；toolkit 1.3.0，需 `runtime-1.3.0` 分支 |
+
+**GGUF / NPU 后端**（标准量化 `.gguf`，经 `ggml-rknpu2` 在 NPU 上运行）：
+
+| 模型 | 架构 | 文件 | 备注 |
+|---|---|---|---|
+| **Qwen3.5 0.8B** | qwen3 | `Qwen3.5-0.8B-Q4_K_M.gguf`（508 MB） | Q4_K_M，约 21 tok/s |
+| **Qwen2.5 0.5B** | qwen2 | `qwen2.5-0.5b-instruct-q8_0.gguf`（645 MB） | Q8_0，加载 4s |
+| **Gemma-3 1B** | gemma3 | `gemma-3-1b-it-Q8_0.gguf`（1020 MB） | Q8_0，加载 10s |
+| **Llama-3.2 1B** | llama | `Llama-3.2-1B-Instruct-Q8_0.gguf`（1.3 GB） | Q8_0，加载 11s |
+
+GGUF 后端对架构无限制——任意标准量化 `.gguf` 即可（后端即时重新量化为 NPU 原生管线 W16A16/W8A8/W4A4）。已验证 qwen2 / qwen3 / gemma3 / llama 四种架构均正常。
+
+已验证的流程：冷启动加载、模型切换（卸载→加载）、纯文本聊天、多模态图片识别，以及 router API（`/models/load`、`/models/unload`、`/v1/chat/completions`）。更多模型将在验证后补充（见 TODO）。
 
 ---
 
@@ -134,7 +158,21 @@ ulimit -n 65536
 内置的两个 `.so` 文件是瑞芯微专有的 NPU 运行时（见上方的"已测试环境"表格及 [NOTICE.md](./NOTICE.md)）：
 
 - `librknnrt.so` —— **RKNN 运行时**（NPU 计算）。被本仓库的 `ggml-rknpu2` 后端（在 NPU 上运行 `.gguf` 模型）**和** RKNN 视觉编码器调用。瑞芯微并不提供"GGUF 后端"——该后端是本仓库中针对 RKNN 运行时编写的代码。
-- `librkllmrt.so` —— **RKLLM 运行时**，用于进程内 RKLLM 后端运行原生 `.rkllm` 模型。
+- `librkllmrt.so` —— **RKLLM 运行时**，用于进程内 RKLLM 后端运行原生 `.rkllm` 模型。**版本与 `.rkllm` 模型锁定**：见上方的"RKLLM 运行时版本与分支"。
+
+**切换 RKLLM 运行时版本**（当你的 `.rkllm` 模型需要不同版本时）：
+
+```sh
+# 方式一:切到对应分支(main=1.2.3 / runtime-1.3.0=1.3.0),重新编译
+git checkout runtime-1.3.0 && cd build && make -j$(nproc) llama-server
+
+# 方式二:用脚本单独下载替换 .so(不切分支)
+./deploy/fetch-rkllm-runtime.sh --list       # 列出可用版本
+./deploy/fetch-rkllm-runtime.sh --current    # 查看当前版本
+./deploy/fetch-rkllm-runtime.sh 1.3.0        # 下载并替换(自动备份+校验)
+```
+
+> ⚠️ 跨大版本切换（如 1.2.3 ↔ 1.3.0）涉及头文件 ABI 变化，**必须切到对应分支并重新编译**；仅用脚本换 `.so` 而不换头文件会导致崩溃。小版本（如 1.2.2↔1.2.3）一般可直接换 `.so`。
 
 ### 故障排查
 
@@ -337,7 +375,7 @@ API 随后可在 `http://<设备IP>:8080` 访问。
 
 - [ ] **RKNN 视觉编码器 + GGUF LLM 主干的混合** —— `tools/mtmd/rknn_encoder` 路径已存在，但需要集成测试，让 RKNN 编码器能够喂给 `.gguf` 主干（目前编码器仅接入了 RKLLM 主干）。
 - [ ] **更广泛的模型支持** —— 在现有的 Qwen / Gemma 组合之外，测试更多 `.rkllm` LLM 与 `.rknn` 视觉编码器组合。
-- [ ] **驱动 / SDK 版本兼容性** —— 目前仅在 RKNN 驱动 `0.9.6+` 与 RKLLM `1.2.3` 上验证。需测试更多新老 RKNN / RKLLM 版本，并记录支持范围。
+- [ ] **驱动 / SDK 版本兼容性** —— 已验证 RKNN 驱动 `0.9.6+`/`0.9.8`、RKLLM 运行时 `1.2.3` 与 `1.3.0`（见分支 `runtime-1.3.0`）。更老/更新的版本仍需补充测试。
 - [ ] **RK3576 配置** —— 补全 `ggml/src/ggml-rknpu2/` 中占位的设备配置。
 - [ ] **工具 / 函数调用的健壮性**，以及 RKLLM 后端的流式输出边界情况。
 
