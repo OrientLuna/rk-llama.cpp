@@ -216,6 +216,7 @@ c = 2048
 | `model` | 模型文件路径（`.rkllm` 或 `.gguf`） |
 | `backend = rkllm` | 通过 `librkllmrt.so` 进程内加载。**省略**则走 GGUF / 子进程路径。 |
 | `mmproj` | RKLLM 后端：**`.rknn` 视觉编码器**路径；GGUF 后端：标准 `mmproj-*.gguf` 投影器。可选。 |
+| `tags` | 可选的 WebUI 标签，逗号分隔，例如 `0.8B,rkllm,rknn`。仅用于展示，请按每个模型手动填写。 |
 | `c` | 最大上下文长度（RKLLM 默认 2048） |
 | `load-on-startup` | `true` 时在服务启动时**预加载**该模型 |
 | `jinja`、`reasoning` | 模板 / 推理格式开关 |
@@ -339,6 +340,7 @@ API 随后可在 `http://<设备IP>:8080` 访问。
 - [ ] **更广泛的模型支持** —— 在现有的 Qwen / Gemma 组合之外，测试更多 `.rkllm` LLM 与 `.rknn` 视觉编码器组合。
 - [ ] **驱动 / SDK 版本兼容性** —— 目前仅在 RKNN 驱动 `0.9.6+` 与 RKLLM `1.2.3` 上验证。需测试更多新老 RKNN / RKLLM 版本，并记录支持范围。
 - [ ] **RK3576 配置** —— 补全 `ggml/src/ggml-rknpu2/` 中占位的设备配置。
+- [ ] **RKLLM 响应指标** —— 当前 RKLLM 通路尚未提供 OpenAI 兼容的 `usage`（输入/输出 token 数）或 `timings`（延迟、tokens/s）。SDK 可通过结果回调提供 `RKLLMPerfStat`，但要安全地接入非流式和 SSE 响应仍需进一步工作，本版本暂不实现。
 - [ ] **工具 / 函数调用的健壮性**，以及 RKLLM 后端的流式输出边界情况。
 
 ---

@@ -216,6 +216,7 @@ The section name (`[my-gguf-model]`) becomes the model's ID in the API — name 
 | `model` | Path to the model file (`.rkllm` or `.gguf`) |
 | `backend = rkllm` | Load in-process via `librkllmrt.so`. **Omit** for the GGUF / subprocess path. |
 | `mmproj` | RKLLM backend: path to the **`.rknn` vision encoder**. GGUF backend: the standard `mmproj-*.gguf` projector. Optional. |
+| `tags` | Optional comma-separated WebUI badges, e.g. `0.8B,rkllm,rknn`. These are informational only; fill them in per model. |
 | `c` | Max context length (default 2048 for RKLLM) |
 | `load-on-startup` | `true` to **preload** this model when the server starts |
 | `jinja`, `reasoning` | Template / reasoning-format toggles |
@@ -339,7 +340,7 @@ This is an active edge-AI integration, not a finished product. Work in progress:
 - [ ] **Broader model support** — test more `.rkllm` LLM and `.rknn` vision-encoder combinations beyond the current Qwen / Gemma set.
 - [ ] **Driver / SDK version compatibility** — currently verified only on RKNN driver `0.9.6+` and RKLLM `1.2.3`. Test against older and newer RKNN / RKLLM releases and document the supported range.
 - [ ] **RK3576 configuration** — fill in the stubbed device config in `ggml/src/ggml-rknpu2/`.
-- [ ] **Tool / function-calling robustness** and streaming edge cases in the RKLLM backend.
+- [ ] **RKLLM response metrics** — the RKLLM path currently does not expose OpenAI-compatible `usage` (prompt/completion token counts) or `timings` (latency/tokens per second). The SDK exposes `RKLLMPerfStat` through the result callback, but integrating it safely into both non-streaming and SSE responses needs further work; keep this out of the current release.
 
 ---
 
