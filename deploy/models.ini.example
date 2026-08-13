@@ -12,6 +12,8 @@ reasoning = off
 [my-gguf-model]
 model = models/your-llm-Q4_K_M.gguf
 mmproj = models/mmproj-your-llm-F16.gguf
+# Optional WebUI badges. Section names are model IDs; keep tags explicit.
+# tags = 0.8B,gguf
 
 # Set load-on-startup = true to preload a model when the server starts.
 # This is independent of --no-models-autoload (which only blocks on-demand
@@ -23,6 +25,7 @@ mmproj = models/mmproj-your-llm-F16.gguf
 # subprocess). `mmproj` points at the .rknn vision encoder for multimodal input.
 [my-rkllm-model]
 backend = rkllm
+tags = 0.8B,rkllm,rknn
 model = models/your-llm-w4a16.rkllm
 mmproj = models/your-vision-encoder.rknn
 c = 2048
