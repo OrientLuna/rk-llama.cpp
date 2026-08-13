@@ -882,6 +882,24 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
                 req.path.find("/v1/completions") != std::string::npos) {
                 return rkllm_ptr->chat_completion(name, req.body, req.should_stop);
             }
+            // /props: the web UI reads modalities.vision from here to decide
+            // whether to show the image-upload control. Report vision=true when
+            // an RKNN vision encoder is loaded.
+            if (req.path == "/props" || req.path.find("/props") != std::string::npos) {
+                auto res = std::make_unique<server_http_res>();
+                res->status = 200;
+                res->content_type = "application/json";
+                json props = {
+                    {"model_alias", name},
+                    {"modalities", json {
+                        {"vision", rkllm_ptr->has_vision()},
+                        {"audio",  false},
+                    }},
+                    {"total_slots", 1},
+                };
+                res->data = props.dump();
+                return res;
+            }
             // Unsupported endpoint for RKLLM
             auto res = std::make_unique<server_http_res>();
             res->status = 501;
@@ -1098,16 +1116,28 @@ void server_models_routes::init_routes() {
                 status["exit_code"] = meta.exit_code;
                 status["failed"]    = true;
             }
+            // A model is multimodal if it has a vision encoder / projector
+            // (mmproj): an RKLLM model with a .rknn encoder, or a GGUF model
+            // with an mmproj projector. Exposed so the web UI can show the
+            // image-upload control for such models.
+            std::string mmproj_path;
+            bool has_multimodal = meta.preset.get_option("LLAMA_ARG_MMPROJ", mmproj_path) && !mmproj_path.empty();
+
+            json capabilities = json::array({"completion"});
+            if (has_multimodal) {
+                capabilities.push_back("multimodal");
+            }
+
             models_json.push_back(json {
-                {"id",       meta.name},
-                {"aliases",  meta.aliases},
-                {"tags",     meta.tags},
-                {"backend",  meta.backend.empty() ? "llama" : meta.backend},
-                {"object",   "model"},    // for OAI-compat
-                {"owned_by", "llamacpp"}, // for OAI-compat
-                {"created",  t},          // for OAI-compat
-                {"status",   status},
-                // TODO: add other fields, may require reading GGUF metadata
+                {"id",           meta.name},
+                {"aliases",      meta.aliases},
+                {"tags",         meta.tags},
+                {"backend",      meta.backend.empty() ? "llama" : meta.backend},
+                {"object",       "model"},    // for OAI-compat
+                {"owned_by",     "llamacpp"}, // for OAI-compat
+                {"created",      t},          // for OAI-compat
+                {"status",       status},
+                {"capabilities", capabilities},
             });
         }
         res_ok(res, {
