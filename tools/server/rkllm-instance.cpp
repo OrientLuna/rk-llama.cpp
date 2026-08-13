@@ -217,8 +217,12 @@ bool rkllm_model_instance::load(const std::string & model_path, int max_context_
     param.extend_param.embed_flash   = 1;
     param.extend_param.n_batch       = 1;
 
-    // rkllm_init takes raw LLMResultCallback function pointer (device SDK ABI)
-    int ret = rkllm_init(&handle_, &param, rkllm_result_callback);
+    // rkllm_init takes an RKLLMCallback struct (SDK >= 1.3.0). Populate it
+    // with our result callback; the optional tokenizer/embed callbacks are
+    // left null (only needed for models without an internal tokenizer/embed layer).
+    RKLLMCallback callback{};
+    callback.result_callback = rkllm_result_callback;
+    int ret = rkllm_init(&handle_, &param, &callback);
     if (ret != 0) { RKLLM_LOG("rkllm_init failed ret=%d model=%s\n", ret, model_path.c_str()); return false; }
     loaded_ = true;
     RKLLM_INF("LLM loaded: %s\n", model_path.c_str());
@@ -406,11 +410,14 @@ server_http_res_ptr rkllm_model_instance::chat_completion(
         if (use_multimodal) {
             rkllm_input.input_type = RKLLM_INPUT_MULTIMODAL;
             rkllm_input.multimodal_input.prompt = (char *)prompt.c_str();
-            rkllm_input.multimodal_input.image_embed = image_embed.data();
-            rkllm_input.multimodal_input.n_image_tokens = n_image_tokens;
-            rkllm_input.multimodal_input.n_image = 1;
-            rkllm_input.multimodal_input.image_width = vision_width_;
-            rkllm_input.multimodal_input.image_height = vision_height_;
+            rkllm_input.multimodal_input.image.image_embed = image_embed.data();
+            rkllm_input.multimodal_input.image.n_image_tokens = n_image_tokens;
+            rkllm_input.multimodal_input.image.n_image = 1;
+            rkllm_input.multimodal_input.image.image_width = vision_width_;
+            rkllm_input.multimodal_input.image.image_height = vision_height_;
+            rkllm_input.multimodal_input.image.image_start   = (char *)"<image>";
+            rkllm_input.multimodal_input.image.image_end     = (char *)"</image>";
+            rkllm_input.multimodal_input.image.image_content = (char *)"<image>";
         } else {
             rkllm_input.input_type = RKLLM_INPUT_PROMPT;
             rkllm_input.prompt_input = prompt.c_str();
@@ -467,11 +474,14 @@ server_http_res_ptr rkllm_model_instance::chat_completion(
         if (multimodal_copy) {
             rkllm_input.input_type = RKLLM_INPUT_MULTIMODAL;
             rkllm_input.multimodal_input.prompt = (char *)prompt.c_str();
-            rkllm_input.multimodal_input.image_embed = embed_ptr->data();
-            rkllm_input.multimodal_input.n_image_tokens = n_tokens_copy;
-            rkllm_input.multimodal_input.n_image = 1;
-            rkllm_input.multimodal_input.image_width = vision_width_;
-            rkllm_input.multimodal_input.image_height = vision_height_;
+            rkllm_input.multimodal_input.image.image_embed = embed_ptr->data();
+            rkllm_input.multimodal_input.image.n_image_tokens = n_tokens_copy;
+            rkllm_input.multimodal_input.image.n_image = 1;
+            rkllm_input.multimodal_input.image.image_width = vision_width_;
+            rkllm_input.multimodal_input.image.image_height = vision_height_;
+            rkllm_input.multimodal_input.image.image_start   = (char *)"<image>";
+            rkllm_input.multimodal_input.image.image_end     = (char *)"</image>";
+            rkllm_input.multimodal_input.image.image_content = (char *)"<image>";
         } else {
             rkllm_input.input_type = RKLLM_INPUT_PROMPT;
             rkllm_input.prompt_input = prompt.c_str();
