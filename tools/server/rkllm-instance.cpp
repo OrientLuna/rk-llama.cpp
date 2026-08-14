@@ -345,8 +345,12 @@ void rkllm_model_instance::abort_inference() {
 
 void rkllm_model_instance::unload() {
     abort_inference();
-    if (vision_enc_) { rknn_enc_destroy(vision_enc_); vision_enc_ = nullptr; }
     if (handle_) { rkllm_destroy(handle_); handle_ = nullptr; loaded_ = false; RKLLM_INF("unloaded\n"); }
+    // Release the RKLLM runtime before the optional vision context.  Both use
+    // the same RKNN runtime, and the 1.3.0 SDK does not expose a process-wide
+    // reset API; keeping the destruction order explicit makes switching
+    // experiments reproducible across runtime versions.
+    if (vision_enc_) { rknn_enc_destroy(vision_enc_); vision_enc_ = nullptr; }
 }
 
 // ── Image encoding ──

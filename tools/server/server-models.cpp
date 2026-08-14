@@ -1,5 +1,9 @@
 #include "server-common.h"
 #include "server-models.h"
+#include "server-context.h"
+#ifdef GGML_USE_RKNPU2
+#include "rkllm-instance.h"
+#endif
 
 #include "preset.h"
 #include "download.h"
@@ -18,6 +22,8 @@
 #include <queue>
 #include <filesystem>
 #include <cstring>
+#include <shared_mutex>
+#include <limits>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -45,6 +51,287 @@ extern char **environ;
 // address for child process, this is needed because router may run on 0.0.0.0
 // ref: https://github.com/ggml-org/llama.cpp/issues/17862
 #define CHILD_ADDR "127.0.0.1"
+
+// Experimental switch for the in-process GGUF path.  The subprocess path
+// remains the default until lifecycle and NPU coexistence have been validated
+// on the deployment device.
+static bool use_inprocess_gguf() {
+    const char * value = std::getenv("LLAMA_SERVER_IN_PROCESS_GGUF");
+    return value != nullptr && (
+        std::strcmp(value, "1") == 0 ||
+        std::strcmp(value, "true") == 0 ||
+        std::strcmp(value, "on") == 0
+    );
+}
+
+// Every loaded backend has one lifecycle lock.  Requests hold it until the
+// HTTP response is destroyed; unload takes it exclusively after removing the
+// backend from the routing table.  This makes stream cancellation and reload
+// safe for both in-process backends.
+struct model_lifecycle {
+    std::shared_mutex mutex;
+    std::atomic<bool> stopping{false};
+};
+
+struct model_request_guard {
+    std::shared_ptr<model_lifecycle> lifecycle;
+    std::shared_lock<std::shared_mutex> shared_lock;
+    std::unique_lock<std::shared_mutex> exclusive_lock;
+
+    model_request_guard(std::shared_ptr<model_lifecycle> lifecycle, bool exclusive)
+        : lifecycle(std::move(lifecycle)) {
+        if (!this->lifecycle) {
+            throw std::invalid_argument("backend has no lifecycle state");
+        }
+        if (exclusive) {
+            exclusive_lock = std::unique_lock<std::shared_mutex>(this->lifecycle->mutex);
+        } else {
+            shared_lock = std::shared_lock<std::shared_mutex>(this->lifecycle->mutex);
+        }
+        if (this->lifecycle->stopping) {
+            throw std::invalid_argument("backend model is stopping");
+        }
+    }
+};
+
+struct gguf_model_instance {
+    common_params params;
+    server_context context;
+    std::unique_ptr<server_routes> routes;
+    std::thread loop;
+    std::shared_ptr<model_lifecycle> lifecycle;
+    bool stopped = false;
+
+    gguf_model_instance(const common_preset & preset, std::shared_ptr<model_lifecycle> lifecycle)
+        : lifecycle(std::move(lifecycle)) {
+        // Initialize server-specific defaults before applying the preset.  The
+        // router normally gets these defaults from the CLI parser, while an
+        // in-process model has no child argv to parse.
+        common_params_parser_init(params, LLAMA_EXAMPLE_SERVER);
+        preset.apply_to_params(params);
+
+        if (params.n_parallel < 0) {
+            params.n_parallel = 4;
+            params.kv_unified = true;
+        }
+        if (params.model.path.empty()) {
+            throw std::runtime_error("in-process GGUF backend requires a model path");
+        }
+    }
+
+    ~gguf_model_instance() {
+        stop();
+    }
+
+    bool start() {
+        if (!context.load_model(params)) {
+            return false;
+        }
+
+        routes = std::make_unique<server_routes>(params, context);
+        routes->update_meta(context);
+        loop = std::thread([this]() {
+            context.start_loop();
+        });
+        return true;
+    }
+
+    void stop() {
+        std::unique_lock<std::shared_mutex> lock(lifecycle->mutex);
+        if (stopped) {
+            return;
+        }
+        stopped = true;
+        context.terminate();
+        lock.unlock();
+
+        if (loop.joinable()) {
+            loop.join();
+        }
+        routes.reset();
+    }
+
+    server_http_res_ptr dispatch(const server_http_req & req, const std::string & method) {
+        if (!routes) {
+            throw std::runtime_error("in-process GGUF routes are not initialized");
+        }
+
+        const auto & path = req.path;
+        server_http_context::handler_t * handler = nullptr;
+
+        if (path == "/health" || path == "/v1/health") {
+            handler = &routes->get_health;
+        } else if (path == "/metrics") {
+            handler = &routes->get_metrics;
+        } else if (path == "/slots") {
+            handler = &routes->get_slots;
+        } else if (path == "/props") {
+            handler = method == "GET" ? &routes->get_props : &routes->post_props;
+        } else if (path == "/api/show") {
+            handler = &routes->get_api_show;
+        } else if (path == "/completion" || path == "/completions") {
+            handler = &routes->post_completions;
+        } else if (path == "/v1/completions") {
+            handler = &routes->post_completions_oai;
+        } else if (path == "/chat/completions" || path == "/v1/chat/completions" || path == "/api/chat") {
+            handler = &routes->post_chat_completions;
+        } else if (path == "/v1/responses" || path == "/responses") {
+            handler = &routes->post_responses_oai;
+        } else if (path == "/v1/messages") {
+            handler = &routes->post_anthropic_messages;
+        } else if (path == "/v1/messages/count_tokens") {
+            handler = &routes->post_anthropic_count_tokens;
+        } else if (path == "/infill") {
+            handler = &routes->post_infill;
+        } else if (path == "/embedding" || path == "/embeddings") {
+            handler = &routes->post_embeddings;
+        } else if (path == "/v1/embeddings") {
+            handler = &routes->post_embeddings_oai;
+        } else if (path == "/rerank" || path == "/reranking" || path == "/v1/rerank" || path == "/v1/reranking") {
+            handler = &routes->post_rerank;
+        } else if (path == "/tokenize") {
+            handler = &routes->post_tokenize;
+        } else if (path == "/detokenize") {
+            handler = &routes->post_detokenize;
+        } else if (path == "/apply-template") {
+            handler = &routes->post_apply_template;
+        } else if (path == "/lora-adapters") {
+            handler = method == "GET" ? &routes->get_lora_adapters : &routes->post_lora_adapters;
+        } else if (path.rfind("/slots/", 0) == 0) {
+            handler = &routes->post_slots;
+        }
+
+        if (handler == nullptr || !*handler) {
+            throw std::invalid_argument("unsupported endpoint for in-process GGUF backend: " + path);
+        }
+        return (*handler)(req);
+    }
+};
+
+server_model_backend::server_model_backend(std::shared_ptr<model_lifecycle> lifecycle)
+    : lifecycle(std::move(lifecycle)) {}
+
+struct gguf_model_backend final : server_model_backend {
+    std::shared_ptr<gguf_model_instance> instance;
+
+    gguf_model_backend(
+            std::shared_ptr<gguf_model_instance> instance,
+            std::shared_ptr<model_lifecycle> lifecycle)
+        : server_model_backend(std::move(lifecycle)), instance(std::move(instance)) {}
+
+    bool uses_npu() const override { return true; }
+    bool is_rkllm() const override { return false; }
+    bool is_loaded() const override { return instance != nullptr && !instance->stopped; }
+    std::shared_ptr<model_request_guard> begin_request() override {
+        return std::make_shared<model_request_guard>(lifecycle, false);
+    }
+    server_http_res_ptr dispatch(
+            const server_http_req & req,
+            const std::string & method,
+            const std::string &) override {
+        if (!instance) {
+            throw std::runtime_error("GGUF backend instance is not initialized");
+        }
+        return instance->dispatch(req, method);
+    }
+    void stop() override {
+        if (instance) {
+            instance->stop();
+        }
+    }
+};
+
+#ifdef GGML_USE_RKNPU2
+struct rkllm_model_backend final : server_model_backend {
+    std::shared_ptr<rkllm_model_instance> instance;
+
+    rkllm_model_backend(
+            std::shared_ptr<rkllm_model_instance> instance,
+            std::shared_ptr<model_lifecycle> lifecycle)
+        : server_model_backend(std::move(lifecycle)), instance(std::move(instance)) {}
+
+    bool uses_npu() const override { return true; }
+    bool is_rkllm() const override { return true; }
+    bool is_loaded() const override { return instance != nullptr && instance->is_loaded(); }
+    std::shared_ptr<model_request_guard> begin_request() override {
+        return std::make_shared<model_request_guard>(lifecycle, true);
+    }
+    server_http_res_ptr dispatch(
+            const server_http_req & req,
+            const std::string &,
+            const std::string & model_name) override {
+        if (!instance || !instance->is_loaded()) {
+            throw std::runtime_error("RKLLM backend instance is not loaded");
+        }
+
+        if (req.path.find("/v1/chat/completions") != std::string::npos ||
+            req.path.find("/v1/completions") != std::string::npos) {
+            return instance->chat_completion(model_name, req.body, req.should_stop);
+        }
+
+        // /props is used by the WebUI to expose the vision upload control.
+        if (req.path == "/props" || req.path.find("/props") != std::string::npos) {
+            auto res = std::make_unique<server_http_res>();
+            res->status = 200;
+            res->content_type = "application/json";
+            json props = {
+                {"model_alias", model_name},
+                {"modalities", json {
+                    {"vision", instance->has_vision()},
+                    {"audio",  false},
+                }},
+                {"total_slots", 1},
+            };
+            res->data = props.dump();
+            return res;
+        }
+
+        auto res = std::make_unique<server_http_res>();
+        res->status = 501;
+        res->data = "{\"error\":{\"message\":\"RKLLM backend only supports /v1/chat/completions\"}}";
+        res->content_type = "application/json";
+        return res;
+    }
+    void stop() override {
+        if (!instance) {
+            return;
+        }
+        std::unique_lock<std::shared_mutex> lock(lifecycle->mutex);
+        instance->unload();
+    }
+};
+#endif
+
+// Keeps the model instance alive until a direct response, including an SSE
+// response, has been fully consumed by the HTTP layer.
+struct server_http_res_with_model_owner : server_http_res {
+    std::shared_ptr<server_model_backend> owner;
+    std::shared_ptr<model_request_guard> request_guard;
+    server_http_res_ptr inner;
+
+    server_http_res_with_model_owner(
+            std::shared_ptr<server_model_backend> owner,
+            std::shared_ptr<model_request_guard> request_guard,
+            server_http_res_ptr inner)
+        : owner(std::move(owner)),
+          request_guard(std::move(request_guard)),
+          inner(std::move(inner)) {
+        if (!this->inner) {
+            throw std::runtime_error("in-process backend handler returned an empty response");
+        }
+
+        status       = this->inner->status;
+        content_type = this->inner->content_type;
+        data         = this->inner->data;
+        headers      = this->inner->headers;
+        if (this->inner->is_stream()) {
+            next = [this](std::string & output) {
+                return this->inner->next(output);
+            };
+        }
+    }
+
+};
 
 static std::filesystem::path get_server_exec_path() {
 #if defined(_WIN32)
@@ -237,7 +524,10 @@ void server_models::add_model(server_model_meta && meta) {
     mapping[name] = instance_t{
         /* subproc */ std::make_shared<subprocess_s>(),
         /* th      */ std::thread(),
-        /* meta    */ std::move(meta)
+        /* meta    */ std::move(meta),
+        /* stdin   */ nullptr,
+        /* backend */ nullptr,
+        /* lifecycle */ nullptr
     };
 }
 
@@ -497,10 +787,65 @@ std::vector<server_model_meta> server_models::get_all_meta() {
     return result;
 }
 
-void server_models::unload_lru() {
+void server_models::unload_lru(const std::string & requested_name) {
+#ifdef GGML_USE_RKNPU2
+    // RKLLM and the in-process GGUF path both keep RKNN/NPU resources alive
+    // for the lifetime of the model.  On the target driver/runtime, two such
+    // instances can exhaust RKNN file descriptors and NPU memory before the
+    // second model becomes usable.  Treat this as a process-level residency
+    // limit and switch safely through the normal unload path.
+    bool requested_needs_npu = false;
+    {
+        std::unique_lock<std::mutex> lk(mutex);
+        auto it = mapping.find(requested_name);
+        if (it != mapping.end() && it->second.meta.status == SERVER_MODEL_STATUS_UNLOADED) {
+            requested_needs_npu = it->second.meta.backend == "rkllm" ||
+                (use_inprocess_gguf() && it->second.meta.backend != "rkllm");
+        }
+    }
+
+    if (requested_needs_npu) {
+        while (true) {
+            std::string npu_lru;
+            int64_t npu_lru_last_used = std::numeric_limits<int64_t>::max();
+            {
+                std::unique_lock<std::mutex> lk(mutex);
+                for (const auto & [model_name, instance] : mapping) {
+                    if (model_name == requested_name || !instance.meta.is_running()) {
+                        continue;
+                    }
+                    if (instance.backend && instance.backend->uses_npu() &&
+                        instance.meta.last_used < npu_lru_last_used) {
+                        npu_lru = model_name;
+                        npu_lru_last_used = instance.meta.last_used;
+                    }
+                }
+            }
+
+            if (npu_lru.empty()) {
+                break;
+            }
+
+            SRV_INF("in-process NPU residency limit reached, switching from %s to %s\n",
+                npu_lru.c_str(), requested_name.c_str());
+            unload(npu_lru);
+            std::unique_lock<std::mutex> lk(mutex);
+            cv.wait(lk, [this, &npu_lru]() {
+                auto it = mapping.find(npu_lru);
+                return it != mapping.end() && it->second.meta.status == SERVER_MODEL_STATUS_UNLOADED;
+            });
+        }
+    }
+
+    if (base_params.models_max <= 0) {
+        return; // no model-count limit
+    }
+#else
+    GGML_UNUSED(requested_name);
     if (base_params.models_max <= 0) {
         return; // no limit
     }
+#endif
     // remove one of the servers if we passed the models_max (least recently used - LRU)
     std::string lru_model_name = "";
     int64_t lru_last_used = ggml_time_ms();
@@ -534,7 +879,7 @@ void server_models::load(const std::string & name) {
     if (!has_model(name)) {
         throw std::runtime_error("model name=" + name + " is not found");
     }
-    unload_lru();
+    unload_lru(name);
 
     std::lock_guard<std::mutex> lk(mutex);
 
@@ -543,6 +888,14 @@ void server_models::load(const std::string & name) {
         SRV_INF("model %s is not ready\n", name.c_str());
         return;
     }
+
+#ifdef GGML_USE_RKNPU2
+    if (rkllm_runtime_tainted && use_inprocess_gguf() && meta.backend != "rkllm") {
+        throw std::runtime_error(
+            "cannot load an in-process GGUF model after unloading RKLLM in this process; "
+            "restart llama-server to reset the RKNN runtime");
+    }
+#endif
 
     // Re-check capacity under the lock to prevent concurrent loads from
     // exceeding models_max. Without this, the window between unload_lru()
@@ -565,6 +918,7 @@ void server_models::load(const std::string & name) {
     inst.meta           = meta;
     inst.meta.status    = SERVER_MODEL_STATUS_LOADING;
     inst.meta.last_used = ggml_time_ms();
+    inst.lifecycle      = std::make_shared<model_lifecycle>();
 
 #ifdef GGML_USE_RKNPU2
     // RKLLM backend: in-process load (no subprocess, no port)
@@ -585,10 +939,11 @@ void server_models::load(const std::string & name) {
         std::string vision_path;
         inst.meta.preset.get_option("LLAMA_ARG_MMPROJ", vision_path);
 
-        inst.rkllm = std::make_unique<rkllm_model_instance>();
-        if (!inst.rkllm->load(model_path, max_ctx, vision_path)) {
+        auto rkllm = std::make_shared<rkllm_model_instance>();
+        if (!rkllm->load(model_path, max_ctx, vision_path)) {
             throw std::runtime_error("failed to load RKLLM model: " + model_path);
         }
+        inst.backend = std::make_shared<rkllm_model_backend>(std::move(rkllm), inst.lifecycle);
 
         inst.meta.status = SERVER_MODEL_STATUS_LOADED;
         auto & old_instance = mapping[name];
@@ -599,6 +954,27 @@ void server_models::load(const std::string & name) {
         return;
     }
 #endif
+
+    if (use_inprocess_gguf()) {
+        // Experimental GGUF backend: keep the complete llama server context
+        // in this process and route requests directly to its handlers.
+        auto gguf = std::make_shared<gguf_model_instance>(inst.meta.preset, inst.lifecycle);
+        if (!gguf->start()) {
+            throw std::runtime_error("failed to load GGUF model in process: " + name);
+        }
+        inst.backend = std::make_shared<gguf_model_backend>(std::move(gguf), inst.lifecycle);
+
+        inst.meta.port   = 0;
+        inst.meta.status = SERVER_MODEL_STATUS_LOADED;
+        auto & old_instance = mapping[name];
+        if (old_instance.th.joinable()) {
+            old_instance.th.join();
+        }
+        mapping[name] = std::move(inst);
+        cv.notify_all();
+        SRV_INF("in-process GGUF model instance loaded: %s\n", name.c_str());
+        return;
+    }
 
     // GGUF backend: spawn child process with HTTP server
     inst.meta.port      = get_free_port();
@@ -743,21 +1119,37 @@ void server_models::load(const std::string & name) {
 }
 
 void server_models::unload(const std::string & name) {
-    std::lock_guard<std::mutex> lk(mutex);
-    auto it = mapping.find(name);
-    if (it != mapping.end()) {
-#ifdef GGML_USE_RKNPU2
-        // RKLLM: in-process unload (no subprocess to kill)
-        if (it->second.rkllm) {
-            SRV_INF("unloading RKLLM model instance name=%s\n", name.c_str());
-            it->second.rkllm->unload();
-            it->second.rkllm.reset();
-            it->second.meta.status = SERVER_MODEL_STATUS_UNLOADED;
-            it->second.meta.exit_code = 0;
+    std::shared_ptr<server_model_backend> backend;
+    std::shared_ptr<model_lifecycle> lifecycle;
+    {
+        std::unique_lock<std::mutex> lk(mutex);
+        auto it = mapping.find(name);
+        if (it == mapping.end()) {
             return;
         }
+
+        lifecycle = it->second.lifecycle;
+        backend = std::move(it->second.backend);
+        if (backend) {
+            SRV_INF("unloading in-process %s model instance name=%s\n",
+                backend->is_rkllm() ? "RKLLM" : "GGUF", name.c_str());
+        }
+#ifdef GGML_USE_RKNPU2
+        if (backend && backend->is_rkllm()) {
+            rkllm_runtime_tainted = true;
+        }
 #endif
-        if (it->second.meta.is_running()) {
+        bool inprocess = backend != nullptr;
+        if (inprocess) {
+            // The backend is now unreachable from the routing table. Existing
+            // requests keep their guard and are drained below.
+            if (lifecycle) {
+                lifecycle->stopping = true;
+            }
+            it->second.meta.status = SERVER_MODEL_STATUS_UNLOADED;
+            it->second.meta.exit_code = 0;
+            cv.notify_all();
+        } else if (it->second.meta.is_running()) {
             SRV_INF("stopping model instance name=%s\n", name.c_str());
             stopping_models.insert(name);
             cv_stop.notify_all();
@@ -766,23 +1158,41 @@ void server_models::unload(const std::string & name) {
             SRV_WRN("model instance name=%s is not running\n", name.c_str());
         }
     }
+
+    if (backend) {
+        backend->stop();
+    }
 }
 
 void server_models::unload_all() {
     std::vector<std::thread> to_join;
+    struct pending_inprocess_model {
+        std::shared_ptr<model_lifecycle> lifecycle;
+        std::shared_ptr<server_model_backend> backend;
+    };
+    std::vector<pending_inprocess_model> inprocess_models;
     {
         std::lock_guard<std::mutex> lk(mutex);
         for (auto & [name, inst] : mapping) {
+            if (inst.backend) {
+                SRV_INF("unloading in-process %s model instance name=%s\n",
+                    inst.backend->is_rkllm() ? "RKLLM" : "GGUF", name.c_str());
+                pending_inprocess_model pending;
+                pending.lifecycle = inst.lifecycle;
+                pending.backend = std::move(inst.backend);
 #ifdef GGML_USE_RKNPU2
-            // RKLLM: in-process unload
-            if (inst.rkllm) {
-                SRV_INF("unloading RKLLM model instance name=%s\n", name.c_str());
-                inst.rkllm->unload();
-                inst.rkllm.reset();
+                if (pending.backend->is_rkllm()) {
+                    rkllm_runtime_tainted = true;
+                }
+#endif
+                if (pending.lifecycle) {
+                    pending.lifecycle->stopping = true;
+                }
                 inst.meta.status = SERVER_MODEL_STATUS_UNLOADED;
+                inst.meta.exit_code = 0;
+                inprocess_models.push_back(std::move(pending));
                 continue;
             }
-#endif
             if (inst.meta.is_running()) {
                 SRV_INF("stopping model instance name=%s\n", name.c_str());
                 stopping_models.insert(name);
@@ -790,6 +1200,11 @@ void server_models::unload_all() {
             }
             // moving the thread to join list to avoid deadlock
             to_join.push_back(std::move(inst.th));
+        }
+    }
+    for (auto & pending : inprocess_models) {
+        if (pending.backend) {
+            pending.backend->stop();
         }
     }
     for (auto & th : to_join) {
@@ -863,52 +1278,35 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
         mapping[name].meta.last_used = ggml_time_ms();
     }
 
-#ifdef GGML_USE_RKNPU2
-    // RKLLM backend: in-process inference (no HTTP proxy)
-    // Grab the rkllm pointer under lock, then release before calling chat_completion
-    // (chat_completion may block on mutex_ for serial inference)
+    std::shared_ptr<server_model_backend> backend;
+    bool inprocess = false;
     {
-        rkllm_model_instance * rkllm_ptr = nullptr;
-        {
-            std::unique_lock<std::mutex> lk(mutex);
-            auto it = mapping.find(name);
-            if (it != mapping.end() && it->second.rkllm && it->second.rkllm->is_loaded()) {
-                rkllm_ptr = it->second.rkllm.get();
-            }
-        }
-        if (rkllm_ptr) {
-            SRV_INF("RKLLM in-process inference for model %s\n", name.c_str());
-            if (req.path.find("/v1/chat/completions") != std::string::npos ||
-                req.path.find("/v1/completions") != std::string::npos) {
-                return rkllm_ptr->chat_completion(name, req.body, req.should_stop);
-            }
-            // /props: the web UI reads modalities.vision from here to decide
-            // whether to show the image-upload control. Report vision=true when
-            // an RKNN vision encoder is loaded.
-            if (req.path == "/props" || req.path.find("/props") != std::string::npos) {
-                auto res = std::make_unique<server_http_res>();
-                res->status = 200;
-                res->content_type = "application/json";
-                json props = {
-                    {"model_alias", name},
-                    {"modalities", json {
-                        {"vision", rkllm_ptr->has_vision()},
-                        {"audio",  false},
-                    }},
-                    {"total_slots", 1},
-                };
-                res->data = props.dump();
-                return res;
-            }
-            // Unsupported endpoint for RKLLM
-            auto res = std::make_unique<server_http_res>();
-            res->status = 501;
-            res->data = "{\"error\":{\"message\":\"RKLLM backend only supports /v1/chat/completions\"}}";
-            res->content_type = "application/json";
-            return res;
+        std::unique_lock<std::mutex> lk(mutex);
+        auto it = mapping.find(name);
+        if (it != mapping.end()) {
+            backend = it->second.backend;
+            inprocess = backend != nullptr;
+            // An in-process instance may be between routing-table removal and
+            // backend destruction. Do not fall through to port 0 as if it
+            // were a child server.
+            inprocess = inprocess || it->second.meta.port == 0;
         }
     }
-#endif
+    if (inprocess) {
+        if (backend && backend->is_loaded()) {
+            SRV_INF("dispatching request to in-process %s model %s\n",
+                backend->is_rkllm() ? "RKLLM" : "GGUF", name.c_str());
+            auto request_guard = backend->begin_request();
+            auto inner = backend->dispatch(req, method, name);
+            return std::make_unique<server_http_res_with_model_owner>(
+                std::move(backend), std::move(request_guard), std::move(inner));
+        }
+        auto res = std::make_unique<server_http_res>();
+        res->status = 503;
+        res->data = "{\"error\":{\"message\":\"model backend is stopping or unavailable\"}}";
+        res->content_type = "application/json";
+        return res;
+    }
 
     SRV_INF("proxying request to model %s on port %d\n", name.c_str(), meta->port);
     std::string proxy_path = req.path;

@@ -2,6 +2,8 @@ version = 1
 
 # This file is the model registry and runtime configuration. The read-only
 # /v1/models endpoint reports the entries defined here; it does not replace it.
+# `tags` below are explicit registry/API tags. They are the same field for
+# GGUF and RKLLM entries; they are not read from the GGUF binary itself.
 
 # Default options applied to every model section below.
 [*]
@@ -10,6 +12,8 @@ jinja = true
 reasoning = off
 
 # --- GGUF backbone (run via the standard llama.cpp / ggml-rknpu2 path) ---
+# With LLAMA_SERVER_IN_PROCESS_GGUF=1, this entry uses the experimental
+# in-process GGUF adapter instead of a child llama-server process.
 # The section name in [brackets] becomes the model's ID in the API. Name it
 # whatever you like. Paths are relative to the launch directory, or absolute.
 [my-gguf-model]
@@ -37,3 +41,10 @@ c = 2048
 # Any section name works. At startup, pass --default-model <section-name>
 # (or env LLAMA_ARG_DEFAULT_MODEL). Chat requests without a "model" field
 # then resolve to that model instead of returning an error.
+#
+# The experimental single-process GGUF path is enabled at launch time, not per
+# model, so the same registry can contain both formats:
+#   LLAMA_SERVER_IN_PROCESS_GGUF=1 llama-server --models-preset deploy/models.ini
+# On the validated RKLLM 1.3.0 target, GGUF -> RKLLM works in one process. After
+# RKLLM unload, switching back to in-process GGUF is rejected until restart
+# because the runtime can retain process-level RKNN state.

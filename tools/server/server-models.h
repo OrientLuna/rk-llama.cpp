@@ -11,10 +11,6 @@
 #include <memory>
 #include <set>
 
-#ifdef GGML_USE_RKNPU2
-#include "rkllm-instance.h"
-#endif
-
 /**
  * state diagram:
  *
@@ -87,6 +83,27 @@ struct server_model_meta {
 };
 
 struct subprocess_s;
+struct model_lifecycle;
+struct model_request_guard;
+
+// Shared server-level contract for in-process model implementations. Concrete
+// adapters keep their runtime ABI and inference translation private.
+struct server_model_backend {
+    std::shared_ptr<model_lifecycle> lifecycle;
+
+    explicit server_model_backend(std::shared_ptr<model_lifecycle> lifecycle);
+    virtual ~server_model_backend() = default;
+
+    virtual bool uses_npu() const = 0;
+    virtual bool is_rkllm() const = 0;
+    virtual bool is_loaded() const = 0;
+    virtual std::shared_ptr<model_request_guard> begin_request() = 0;
+    virtual server_http_res_ptr dispatch(
+        const server_http_req & req,
+        const std::string & method,
+        const std::string & model_name) = 0;
+    virtual void stop() = 0;
+};
 
 struct server_models {
 private:
@@ -95,14 +112,19 @@ private:
         std::thread th;
         server_model_meta meta;
         FILE * stdin_file = nullptr;
-#ifdef GGML_USE_RKNPU2
-        std::unique_ptr<rkllm_model_instance> rkllm; // in-process RKLLM backend (null for GGUF)
-#endif
+        std::shared_ptr<server_model_backend> backend; // optional in-process backend
+        std::shared_ptr<model_lifecycle> lifecycle; // shared request/unload coordination
     };
 
     std::mutex mutex;
     std::condition_variable cv;
     std::map<std::string, instance_t> mapping;
+#ifdef GGML_USE_RKNPU2
+    // RKLLM 1.3.0 can leave process-level RKNN state behind after destroy;
+    // once that path has been unloaded, reinitializing an in-process GGUF
+    // backend is not safe on the validated target runtime.
+    bool rkllm_runtime_tainted = false;
+#endif
 
     // for stopping models
     std::condition_variable cv_stop;
@@ -117,8 +139,9 @@ private:
 
     void update_meta(const std::string & name, const server_model_meta & meta);
 
-    // unload least recently used models if the limit is reached
-    void unload_lru();
+    // unload least recently used models if the limit or the process NPU
+    // residency policy is reached
+    void unload_lru(const std::string & requested_name = {});
 
     // not thread-safe, caller must hold mutex
     void add_model(server_model_meta && meta);

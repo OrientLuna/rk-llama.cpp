@@ -42,7 +42,7 @@ The following model files have been verified to load and run on the tested envir
 | **Qwen3-VL 2B Instruct** | `qwen3-vl-2b-instruct_w8a8_rk3588.rkllm` (2.3 GB) + `qwen3-vl-2b_vision_rk3588.rknn` (812 MB) | `rkllm` | ✅ vision | W8A8 quant; in-process backend |
 | **Qwen3.5 0.8B** | `Qwen3.5-0.8B-Q4_K_M.gguf` (508 MB) + `mmproj-Qwen3.5-0.8B-F16.gguf` (196 MB) | `llama` (NPU) | ✅ projector | Q4_K_M; runs on the NPU via `ggml-rknpu2`, ~21 tok/s |
 
-Tested flows: cold load, model switch (unload → load), chat completion (text + Chinese + arithmetic), and the router API (`/models/load`, `/v1/chat/completions`). More models will be added as they are validated — broader coverage is tracked in the TODO section.
+Tested flows: cold load, standard router model switch (unload → load), chat completion (text + Chinese + arithmetic), and the router API (`/models/load`, `/v1/chat/completions`). The experimental in-process path has additional switch boundaries described below. More models will be added as they are validated — broader coverage is tracked in the TODO section.
 
 ---
 
@@ -86,6 +86,36 @@ The upstream rk-llama.cpp accelerates **`.gguf`** models on the NPU via a custom
 2. **Multimodal vision support** — an RKNN **`.rknn`** vision encoder runs on `librknnrt.so`, produces image embeddings, and feeds them to the RKLLM backbone via `RKLLM_INPUT_MULTIMODAL`. Images can be supplied as a file path, a `file://` URI, or a base64 `data:` URI.
 
 The original `.gguf` + NPU path still works (see the backend README linked above).
+
+### Experimental single-process model manager
+
+By default, the router still starts a separate `llama-server` child process for
+GGUF models, while RKLLM runs in the router process. Set the following variable
+to load GGUF through an in-process `server_context` as well. One process then
+shares model registration, `/v1/models`, request routing, unload, and switching
+for both formats:
+
+```sh
+LLAMA_SERVER_IN_PROCESS_GGUF=1 \
+  ./build/bin/llama-server --models-preset deploy/models.ini \
+  --default-model my-gguf-model --models-max 1 \
+  --host 0.0.0.0 --port 8080 -c 2048
+```
+
+This is currently an opt-in POC; the default remains the isolated GGUF child
+process. On the target device with RKLLM runtime 1.3.0, `GGUF -> RKLLM` works in
+one process. After RKLLM is unloaded, the runtime may retain process-level RKNN
+state, so `RKLLM -> GGUF` returns HTTP 500 and asks for a `llama-server` restart
+instead of risking a crash. `--models-max` limits active entries in the model
+manager but does not guarantee that multiple NPU backends can remain resident;
+NPU models are serialized and the old instance is unloaded before switching.
+
+The router now targets a minimal `server_model_backend` management interface,
+but RKLLM inference, vision encoding, and ABI handling are still implemented by
+a dedicated adapter. It is not yet a general GGML compute backend.
+See [`docs/rkllm-backend-boundary.md`](./docs/rkllm-backend-boundary.md) for the
+ABI, runtime-resource evidence, and the detailed assessment of the higher
+integration target.
 
 ### Supported model formats
 
@@ -220,7 +250,7 @@ c = 2048
 
 The section name (`[my-gguf-model]`) becomes the model's ID in the API — name it whatever you like. Add as many sections as you want; `--models-max N` caps how many can be loaded at once.
 
-`models.ini` remains the source of model registration and runtime configuration. `/v1/models` is a read-only discovery view of models already registered in the INI; it does not replace the INI or create model entries. Put `tags` in each GGUF/RKLLM section when you want them shown in the WebUI or API.
+`models.ini` remains the source of model registration and runtime configuration. `/v1/models` is a read-only discovery view of models already registered in the INI; it does not replace the INI or create model entries. Put `tags` in each GGUF/RKLLM section when you want them shown in the WebUI or API. These are explicit registry tags (the same field as single-model `--tags`), not tags inferred from GGUF metadata, so both formats use the same INI field.
 
 **INI key reference:**
 
@@ -324,6 +354,7 @@ Key points:
 - `LD_LIBRARY_PATH` — must include the `libs/` dir so the loader finds `librknnrt.so` / `librkllmrt.so`. The unit also sets `LimitNOFILE=65536` so you don't need the manual `ulimit` for the service.
 - `--models-preset` — points at your edited `models.ini` (copy it from `deploy/models.ini.example` first; see the Run section).
 - `--default-model <model-id>` — optional; the section name from `models.ini` to serve when a request omits `model:`. Remove the line if you want every request to name a model explicitly.
+- `LLAMA_SERVER_IN_PROCESS_GGUF=1` — optional experimental switch; enables the in-process GGUF adapter alongside `backend = rkllm`. The RKLLM → GGUF restart boundary is described above; production deployments should leave it unset by default.
 
 ### 2. Install and enable
 
@@ -342,6 +373,7 @@ The API is then at `http://<device-ip>:8080`.
 
 - **Working without systemd** — for development you can launch directly: `cd /opt/rk-llama.cpp && ulimit -n 65536 && ./build/bin/llama-server --models-preset deploy/models.ini ...`.
 - **Models on a separate partition** — common on boards where `/userdata` is a large eMMC/NVMe partition. Just point `models.ini` paths (e.g. `/userdata/models/...`) at it; the service user needs read access.
+- **Single-process smoke test** — with `LLAMA_SERVER_IN_PROCESS_GGUF=1` on a test service, run [`deploy/smoke-unified.sh`](./deploy/smoke-unified.sh) to verify `/v1/models`, shared tags, RKLLM streaming `usage/timings`, and the known switch boundary: `GGUF_MODEL=<id> RKLLM_MODEL=<id> ./deploy/smoke-unified.sh`.
 
 ---
 

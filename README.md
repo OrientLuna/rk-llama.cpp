@@ -42,7 +42,7 @@
 | **Qwen3-VL 2B Instruct** | `qwen3-vl-2b-instruct_w8a8_rk3588.rkllm`（2.3 GB）+ `qwen3-vl-2b_vision_rk3588.rknn`（812 MB） | `rkllm` | ✅ 支持 | W8A8 量化；进程内后端 |
 | **Qwen3.5 0.8B** | `Qwen3.5-0.8B-Q4_K_M.gguf`（508 MB）+ `mmproj-Qwen3.5-0.8B-F16.gguf`（196 MB） | `llama`（NPU） | ✅ 支持 | Q4_K_M；经 `ggml-rknpu2` 在 NPU 上运行，约 21 tok/s |
 
-已验证的流程：冷启动加载、模型切换（卸载→加载）、聊天补全，以及 router API（`/models/load`、`/v1/chat/completions`）。更多模型将在验证后补充（见 TODO）。
+已验证的流程：冷启动加载、标准 router 的模型切换（卸载→加载）、聊天补全，以及 router API（`/models/load`、`/v1/chat/completions`）。实验性单进程路径另有明确的切换边界，见下文。更多模型将在验证后补充（见 TODO）。
 
 ---
 
@@ -86,6 +86,32 @@ curl -s http://localhost:8080/v1/chat/completions \
 2. **多模态视觉支持** —— RKNN **`.rknn`** 视觉编码器运行在 `librknnrt.so` 上，生成图像嵌入并通过 `RKLLM_INPUT_MULTIMODAL` 送入 RKLLM 主干网络。图像可通过文件路径、`file://` URI 或 base64 `data:` URI 三种方式传入。
 
 原有的 `.gguf` + NPU 通路保持不变（见上方链接的后端 README）。
+
+### 实验性单进程模型管理
+
+默认情况下，router 仍为 GGUF 模型派生独立的 `llama-server` 子进程；RKLLM
+则在 router 进程内运行。设置下面的环境变量后，GGUF 也会在 router 进程内
+创建 `server_context`，这样同一个进程可以统一注册、展示 `/v1/models`、路由
+请求、卸载和切换两种格式：
+
+```sh
+LLAMA_SERVER_IN_PROCESS_GGUF=1 \
+  ./build/bin/llama-server --models-preset deploy/models.ini \
+  --default-model my-gguf-model --models-max 1 \
+  --host 0.0.0.0 --port 8080 -c 2048
+```
+
+这是当前的 POC 开关，默认关闭以保留 GGUF 子进程隔离。目标设备上的 RKLLM
+1.3.0 运行时验证结果是：`GGUF -> RKLLM` 顺序切换可以工作；卸载 RKLLM 后，
+运行时可能残留进程级 RKNN 状态，`RKLLM -> GGUF` 会返回明确的 HTTP 500，
+并要求重启 `llama-server`，以避免进程崩溃。`--models-max` 只限制模型管理器
+中的活动数量，不代表多个 NPU backend 一定可以同时驻留；NPU 模型会按需串行
+驻留并在切换前卸载旧实例。
+
+该路径已经收敛到一个最小的 `server_model_backend` 管理接口，但 RKLLM 的
+推理、视觉编码和 ABI 仍由专用 adapter 实现，尚未成为 GGML 的通用计算后端。
+详细的 ABI、运行时资源和最高目标边界见
+[`docs/rkllm-backend-boundary.md`](./docs/rkllm-backend-boundary.md)。
 
 ### 支持的模型格式
 
@@ -220,7 +246,7 @@ c = 2048
 
 小节名（`[my-gguf-model]`）会成为该模型在 API 中的 ID——随便命名。想加多少个模型就加多少个小节；`--models-max N` 限制同时可加载的数量。
 
-`models.ini` 仍然是模型注册和运行配置的来源；`/v1/models` 只是只读的发现接口，返回 INI 中已经注册的模型、tags、backend 和加载状态，不能替代 INI。即使只关心 WebUI 标签，也应在对应的 GGUF/RKLLM 小节中填写 `tags`。
+`models.ini` 仍然是模型注册和运行配置的来源；`/v1/models` 只是只读的发现接口，返回 INI 中已经注册的模型、tags、backend 和加载状态，不能替代 INI。即使只关心 WebUI 标签，也应在对应的 GGUF/RKLLM 小节中填写 `tags`。这里的 tags 是统一的显式注册字段（与单模型模式的 `--tags` 相同），不会自动从 GGUF 文件内部元数据推导；因此 GGUF 与 RKLLM 应使用同一个 INI 字段维护标签。
 
 **INI 键参考：**
 
@@ -324,6 +350,7 @@ LimitNOFILE=65536
 - `LD_LIBRARY_PATH` —— 必须包含 `libs/` 目录，加载器才能找到 `librknnrt.so` / `librkllmrt.so`。单元同时设置了 `LimitNOFILE=65536`，因此服务侧不需要手动 `ulimit`。
 - `--models-preset` —— 指向你编辑好的 `models.ini`（先从 `deploy/models.ini.example` 复制一份；见"运行"章节）。
 - `--default-model <model-id>` —— 可选；`models.ini` 中的小节名，用于请求未带 `model:` 时提供服务。若希望每个请求都显式指定模型，删掉此行。
+- `LLAMA_SERVER_IN_PROCESS_GGUF=1` —— 可选实验开关；与 `backend = rkllm` 一起使用时启用单进程 GGUF adapter。目标设备上的 RKLLM→GGUF 回切限制见上文，生产部署默认建议保持关闭。
 
 ### 2. 安装并启用
 
@@ -342,6 +369,7 @@ API 随后可在 `http://<设备IP>:8080` 访问。
 
 - **不用 systemd** —— 开发时可直接启动：`cd /opt/rk-llama.cpp && ulimit -n 65536 && ./build/bin/llama-server --models-preset deploy/models.ini ...`。
 - **模型放在独立分区** —— 在 `/userdata` 作为大容量 eMMC/NVMe 分区的板子上很常见。把 `models.ini` 路径（如 `/userdata/models/...`）指向它即可；服务账户需要对模型文件有读权限。
+- **单进程 smoke test** —— 在测试服务上设置 `LLAMA_SERVER_IN_PROCESS_GGUF=1` 后，可使用 [`deploy/smoke-unified.sh`](./deploy/smoke-unified.sh) 验证 `/v1/models`、统一 tags、RKLLM 流式 `usage/timings` 和已知切换边界：`GGUF_MODEL=<id> RKLLM_MODEL=<id> ./deploy/smoke-unified.sh`。
 
 ---
 

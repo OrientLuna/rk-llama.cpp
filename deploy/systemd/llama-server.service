@@ -11,6 +11,9 @@ User=<your-user>
 Group=<your-user>
 WorkingDirectory=/opt/rk-llama.cpp
 Environment=LD_LIBRARY_PATH=/opt/rk-llama.cpp/ggml/src/ggml-rknpu2/libs
+# Optional experimental single-process GGUF adapter. Leave commented to keep
+# the default child-process GGUF isolation.
+# Environment=LLAMA_SERVER_IN_PROCESS_GGUF=1
 ExecStart=/opt/rk-llama.cpp/build/bin/llama-server \
     --models-preset /opt/rk-llama.cpp/deploy/models.ini \
     --default-model <model-id> \
