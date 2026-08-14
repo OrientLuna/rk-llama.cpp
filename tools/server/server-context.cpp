@@ -3792,7 +3792,7 @@ void server_routes::init_routes() {
                     {"digest", ""}, // dummy value, llama.cpp does not support managing model file's hash
                     {"type", "model"},
                     {"description", ""},
-                    {"tags", {""}},
+                    {"tags", meta->model_tags},
                     {"capabilities", meta->has_mtmd ? json({"completion","multimodal"}) : json({"completion"})},
                     {"parameters", ""},
                     {"details", {

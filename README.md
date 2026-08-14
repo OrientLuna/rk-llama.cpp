@@ -31,6 +31,8 @@
 | **`main`**（默认） | `1.2.3` | 1.2.3 | toolkit 1.2.x 转换的 `.rkllm` |
 | **`runtime-1.3.0`** | `1.3.0` | 1.3.0 | toolkit 1.3.x 转换的 `.rkllm`（**同时向后兼容 1.2.x 模型**） |
 
+两套 ABI 都支持 RKLLM 的 OpenAI 兼容 `usage` / `timings`：非流式响应返回最终值，SSE 在生成期间可返回实时估计，并在结束时使用 SDK 的 `RKLLMPerfStat`。编译时必须使用与动态库匹配的分支、头文件和二进制；不能只替换 `.so`。1.2.3 的 `RKLLMInferParam` 没有请求级 `max_new_tokens`，所以该分支使用初始化时的 512 上限；1.3.0 支持用请求中的 `max_tokens` / `max_completion_tokens` 覆盖它。
+
 > 切换分支：`git checkout runtime-1.3.0`，然后重新编译。也可用 [`deploy/fetch-rkllm-runtime.sh`](./deploy/fetch-rkllm-runtime.sh) 单独替换 `.so` 而不切分支（见下文）。
 
 ### 已测试模型
@@ -247,6 +249,8 @@ c = 2048
 
 小节名（`[my-gguf-model]`）会成为该模型在 API 中的 ID——随便命名。想加多少个模型就加多少个小节；`--models-max N` 限制同时可加载的数量。
 
+`models.ini` 仍然是模型注册表和运行配置的来源；`/v1/models` 只是只读的发现接口，返回已经注册的模型、tags 和加载状态，不能替代 INI 或创建模型。INI 还负责模型 ID、`.gguf` / `.rkllm` 路径、`backend`、`mmproj`、上下文长度、加载策略、模板和推理选项。GGUF 与 RKLLM 都在各自小节填写 `tags`，服务端会统一通过 `/v1/models` 暴露。
+
 **INI 键参考：**
 
 | 键 | 含义 |
@@ -254,7 +258,7 @@ c = 2048
 | `model` | 模型文件路径（`.rkllm` 或 `.gguf`） |
 | `backend = rkllm` | 通过 `librkllmrt.so` 进程内加载。**省略**则走 GGUF / 子进程路径。 |
 | `mmproj` | RKLLM 后端：**`.rknn` 视觉编码器**路径；GGUF 后端：标准 `mmproj-*.gguf` 投影器。可选。 |
-| `tags` | 可选的 WebUI 标签，逗号分隔，例如 `0.8B,rkllm,rknn`。仅用于展示，请按每个模型手动填写。 |
+| `tags` | GGUF/RKLLM 通用的可选 WebUI/API 标签，逗号分隔，例如 `0.8B,gguf` 或 `0.8B,rkllm,rknn`；服务从 INI 读取后统一显示在 `/v1/models`。 |
 | `c` | 最大上下文长度（RKLLM 默认 2048） |
 | `load-on-startup` | `true` 时在服务启动时**预加载**该模型 |
 | `jinja`、`reasoning` | 模板 / 推理格式开关 |
@@ -376,9 +380,9 @@ API 随后可在 `http://<设备IP>:8080` 访问。
 
 - [ ] **RKNN 视觉编码器 + GGUF LLM 主干的混合** —— `tools/mtmd/rknn_encoder` 路径已存在，但需要集成测试，让 RKNN 编码器能够喂给 `.gguf` 主干（目前编码器仅接入了 RKLLM 主干）。
 - [ ] **更广泛的模型支持** —— 在现有的 Qwen / Gemma 组合之外，测试更多 `.rkllm` LLM 与 `.rknn` 视觉编码器组合。
-- [ ] **驱动 / SDK 版本兼容性** —— 已验证 RKNN 驱动 `0.9.6+`/`0.9.8`、RKLLM 运行时 `1.2.3` 与 `1.3.0`（见分支 `runtime-1.3.0`）。更老/更新的版本仍需补充测试。
+- [x] **驱动 / SDK 版本兼容性** —— 已验证 RKNN 驱动 `0.9.6+`/`0.9.8`、RKLLM 运行时 `1.2.3` 与 `1.3.0`（见分支 `runtime-1.3.0`）。更老/更新的版本仍需补充测试。
 - [ ] **RK3576 配置** —— 补全 `ggml/src/ggml-rknpu2/` 中占位的设备配置。
-- [ ] **RKLLM 响应指标** —— 当前 RKLLM 通路尚未提供 OpenAI 兼容的 `usage`（输入/输出 token 数）或 `timings`（延迟、tokens/s）。SDK 可通过结果回调提供 `RKLLMPerfStat`，但要安全地接入非流式和 SSE 响应仍需进一步工作，本版本暂不实现。
+- [x] **RKLLM 响应指标** —— RKLLM 通路现在提供 OpenAI 兼容的 `usage`（输入/输出/总 token 数）和 `timings`（延迟、tokens/s）；流式期间输出实时估计，结束时使用 SDK 的 `RKLLMPerfStat` 精确值。1.2.3 分支的请求级 `max_tokens` 仍受初始化上限限制。
 - [ ] **工具 / 函数调用的健壮性**，以及 RKLLM 后端的流式输出边界情况。
 
 ---

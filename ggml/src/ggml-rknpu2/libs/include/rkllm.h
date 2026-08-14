@@ -2,6 +2,10 @@
 #define _RKLLM_H_
 #include <cstdint>
 
+// ABI selector used by the in-process server backend. RKLLM 1.2.3 uses the
+// raw callback and flat multimodal input layout.
+#define RKLLM_API_ABI_VERSION 123
+
 #ifdef __cplusplus
 extern "C" {
 #endif

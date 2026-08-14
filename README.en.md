@@ -31,6 +31,8 @@ Other Rockchip SoCs (e.g. RK3576) are **not yet verified** (see TODO).
 | **`main`** (default) | `1.2.3` | 1.2.3 | `.rkllm` converted with toolkit 1.2.x |
 | **`runtime-1.3.0`** | `1.3.0` | 1.3.0 | `.rkllm` converted with toolkit 1.3.x (**backward compatible with 1.2.x models too**) |
 
+Both ABIs support OpenAI-compatible RKLLM `usage` / `timings`: non-streaming responses return final values, while SSE can expose live estimates and replaces them with the SDK's authoritative `RKLLMPerfStat` values at completion. Build with the branch, headers, and binary matching the runtime; do not replace only the `.so`. RKLLM 1.2.3 has no per-request `max_new_tokens` field, so this branch uses the init-time limit of 512; 1.3.0 can override it with request `max_tokens` / `max_completion_tokens`.
+
 > Switch branches with `git checkout runtime-1.3.0`, then rebuild. You can also swap just the `.so` without changing branches via [`deploy/fetch-rkllm-runtime.sh`](./deploy/fetch-rkllm-runtime.sh) (see below).
 
 ### Tested models
@@ -247,6 +249,8 @@ c = 2048
 
 The section name (`[my-gguf-model]`) becomes the model's ID in the API — name it whatever you like. Add as many sections as you want; `--models-max N` caps how many can be loaded at once.
 
+`models.ini` remains the model registry and runtime configuration source. `/v1/models` is only a read-only discovery view of already registered models, tags, and load status; it does not replace the INI or create model entries. The INI also defines model IDs, `.gguf` / `.rkllm` paths, `backend`, `mmproj`, context length, loading policy, template, and reasoning options. Put `tags` in either the GGUF or RKLLM section; the server exposes them uniformly through `/v1/models`.
+
 **INI key reference:**
 
 | Key | Meaning |
@@ -254,7 +258,7 @@ The section name (`[my-gguf-model]`) becomes the model's ID in the API — name 
 | `model` | Path to the model file (`.rkllm` or `.gguf`) |
 | `backend = rkllm` | Load in-process via `librkllmrt.so`. **Omit** for the GGUF / subprocess path. |
 | `mmproj` | RKLLM backend: path to the **`.rknn` vision encoder**. GGUF backend: the standard `mmproj-*.gguf` projector. Optional. |
-| `tags` | Optional comma-separated WebUI badges, e.g. `0.8B,rkllm,rknn`. These are informational only; fill them in per model. |
+| `tags` | Optional comma-separated WebUI/API tags shared by GGUF and RKLLM, e.g. `0.8B,gguf` or `0.8B,rkllm,rknn`; the server reads them from the INI and exposes them through `/v1/models`. |
 | `c` | Max context length (default 2048 for RKLLM) |
 | `load-on-startup` | `true` to **preload** this model when the server starts |
 | `jinja`, `reasoning` | Template / reasoning-format toggles |
@@ -376,9 +380,9 @@ This is an active edge-AI integration, not a finished product. Work in progress:
 
 - [ ] **Mixed RKNN vision encoder + GGUF LLM backbone** — the `tools/mtmd/rknn_encoder` path exists but needs integration testing so an RKNN encoder can feed a `.gguf` backbone (currently the encoder is wired to the RKLLM backbone only).
 - [ ] **Broader model support** — test more `.rkllm` LLM and `.rknn` vision-encoder combinations beyond the current Qwen / Gemma set.
-- [ ] **Driver / SDK version compatibility** — verified on RKNN driver `0.9.6+`/`0.9.8` and RKLLM runtime `1.2.3` & `1.3.0` (see the `runtime-1.3.0` branch). Older/newer versions still need testing.
+- [x] **Driver / SDK version compatibility** — verified on RKNN driver `0.9.6+`/`0.9.8` and RKLLM runtime `1.2.3` & `1.3.0` (see the `runtime-1.3.0` branch). Older/newer versions still need testing.
 - [ ] **RK3576 configuration** — fill in the stubbed device config in `ggml/src/ggml-rknpu2/`.
-- [ ] **RKLLM response metrics** — the RKLLM path currently does not expose OpenAI-compatible `usage` (prompt/completion token counts) or `timings` (latency/tokens per second). The SDK exposes `RKLLMPerfStat` through the result callback, but integrating it safely into both non-streaming and SSE responses needs further work; keep this out of the current release.
+- [x] **RKLLM response metrics** — the RKLLM path now exposes OpenAI-compatible `usage` (prompt/completion/total token counts) and `timings` (latency/tokens per second). Streaming uses live estimates and replaces them with the SDK's authoritative `RKLLMPerfStat` values at completion. Request-level `max_tokens` remains limited by the init-time setting on ABI 1.2.3.
 
 ---
 
