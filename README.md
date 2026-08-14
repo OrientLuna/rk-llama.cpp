@@ -18,9 +18,20 @@
 | **操作系统** | Ubuntu 22.04（基于Forlinx飞凌嵌入式提供的镜像修改） |
 | **编译** | 板上原生编译，`gcc/g++ 11.4`、`cmake 3.22` |
 | **RKNN 驱动** | `0.9.6+`（NPU 运行时 `librknnrt.so`） |
-| **RKLLM 运行时** | `1.2.3`（`librkllmrt.so`） |
+| **RKLLM 运行时** | `1.2.3`（`main`）与 `1.3.0`（`runtime-1.3.0`） |
 
-其它瑞芯微 SoC（如 RK3576）及其它 RKNN/RKLLM 版本**尚未验证**（见 TODO）。对应的运行时库已内置在 `ggml/src/ggml-rknpu2/libs/`；其他版本的动态库请到瑞芯微官方仓库获取。
+其它瑞芯微 SoC（如 RK3576）及其它 RKNN/RKLLM 版本**尚未验证**（见 TODO）。
+
+#### RKLLM 运行时与分支
+
+`.rkllm` 模型通常需要匹配生成它的 `rkllm-toolkit`/运行时版本。两个分支内置的头文件、动态库和服务 ABI 如下：
+
+| 分支 | `librkllmrt.so` | 服务 ABI | 适用模型 |
+|---|---|---|---|
+| `main` | `1.2.3` | 1.2.3 | toolkit 1.2.x 生成的 `.rkllm` |
+| `runtime-1.3.0` | `1.3.0` | 1.3.0 | toolkit 1.3.x 生成的 `.rkllm` |
+
+两套 ABI 都支持本次 RKLLM `usage/timings` 实现，但编译时必须使用与动态库匹配的分支和头文件。不要只替换 `.so` 后继续使用另一分支编译的二进制。可用 [`deploy/fetch-rkllm-runtime.sh`](./deploy/fetch-rkllm-runtime.sh) 查询或切换运行时；跨 ABI 切换后必须重新编译。
 
 ### 已测试模型
 
@@ -209,6 +220,8 @@ c = 2048
 
 小节名（`[my-gguf-model]`）会成为该模型在 API 中的 ID——随便命名。想加多少个模型就加多少个小节；`--models-max N` 限制同时可加载的数量。
 
+`models.ini` 仍然是模型注册和运行配置的来源；`/v1/models` 只是只读的发现接口，返回 INI 中已经注册的模型、tags、backend 和加载状态，不能替代 INI。即使只关心 WebUI 标签，也应在对应的 GGUF/RKLLM 小节中填写 `tags`。
+
 **INI 键参考：**
 
 | 键 | 含义 |
@@ -216,7 +229,7 @@ c = 2048
 | `model` | 模型文件路径（`.rkllm` 或 `.gguf`） |
 | `backend = rkllm` | 通过 `librkllmrt.so` 进程内加载。**省略**则走 GGUF / 子进程路径。 |
 | `mmproj` | RKLLM 后端：**`.rknn` 视觉编码器**路径；GGUF 后端：标准 `mmproj-*.gguf` 投影器。可选。 |
-| `tags` | 可选的 WebUI 标签，逗号分隔，例如 `0.8B,rkllm,rknn`。仅用于展示，请按每个模型手动填写。 |
+| `tags` | GGUF/RKLLM 通用的可选 WebUI/API 标签，逗号分隔，例如 `0.8B,gguf` 或 `0.8B,rkllm,rknn`；服务从 INI 读取后统一显示在 `/v1/models`。 |
 | `c` | 最大上下文长度（RKLLM 默认 2048） |
 | `load-on-startup` | `true` 时在服务启动时**预加载**该模型 |
 | `jinja`、`reasoning` | 模板 / 推理格式开关 |
@@ -338,9 +351,9 @@ API 随后可在 `http://<设备IP>:8080` 访问。
 
 - [ ] **RKNN 视觉编码器 + GGUF LLM 主干的混合** —— `tools/mtmd/rknn_encoder` 路径已存在，但需要集成测试，让 RKNN 编码器能够喂给 `.gguf` 主干（目前编码器仅接入了 RKLLM 主干）。
 - [ ] **更广泛的模型支持** —— 在现有的 Qwen / Gemma 组合之外，测试更多 `.rkllm` LLM 与 `.rknn` 视觉编码器组合。
-- [ ] **驱动 / SDK 版本兼容性** —— 目前仅在 RKNN 驱动 `0.9.6+` 与 RKLLM `1.2.3` 上验证。需测试更多新老 RKNN / RKLLM 版本，并记录支持范围。
+- [x] **驱动 / SDK 版本兼容性** —— 已针对 RKNN 驱动 `0.9.6+` 以及 RKLLM 1.2.3/1.3.0 两套 ABI 保留兼容实现；其它版本仍需补充实机验证。
 - [ ] **RK3576 配置** —— 补全 `ggml/src/ggml-rknpu2/` 中占位的设备配置。
-- [ ] **RKLLM 响应指标** —— 当前 RKLLM 通路尚未提供 OpenAI 兼容的 `usage`（输入/输出 token 数）或 `timings`（延迟、tokens/s）。SDK 可通过结果回调提供 `RKLLMPerfStat`，但要安全地接入非流式和 SSE 响应仍需进一步工作，本版本暂不实现。
+- [x] **RKLLM 响应指标** —— RKLLM 通路现在提供 OpenAI 兼容的 `usage` 和 `timings`；流式生成期间输出实时估计，结束时使用 SDK 的 `RKLLMPerfStat` 精确值。
 - [ ] **工具 / 函数调用的健壮性**，以及 RKLLM 后端的流式输出边界情况。
 
 ---

@@ -1,5 +1,8 @@
 version = 1
 
+# This file is the model registry and runtime configuration. The read-only
+# /v1/models endpoint reports the entries defined here; it does not replace it.
+
 # Default options applied to every model section below.
 [*]
 c = 2048
@@ -12,8 +15,8 @@ reasoning = off
 [my-gguf-model]
 model = models/your-llm-Q4_K_M.gguf
 mmproj = models/mmproj-your-llm-F16.gguf
-# Optional WebUI badges. Section names are model IDs; keep tags explicit.
-# tags = 0.8B,gguf
+# Optional WebUI/API tags. They are exposed at /v1/models for this entry.
+tags = 0.8B,gguf
 
 # Set load-on-startup = true to preload a model when the server starts.
 # This is independent of --no-models-autoload (which only blocks on-demand

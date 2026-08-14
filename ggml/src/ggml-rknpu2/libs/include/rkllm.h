@@ -2,6 +2,9 @@
 #define _RKLLM_H_
 #include <cstdint>
 
+// This header is paired with the vendored librkllmrt.so on each runtime branch.
+#define RKLLM_API_ABI_VERSION 130
+
 #ifdef __cplusplus
 extern "C" {
 #endif

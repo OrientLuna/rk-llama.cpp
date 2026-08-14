@@ -513,6 +513,7 @@ export class ChatService {
 			const content = data.choices[0]?.message?.content || '';
 			const reasoningContent = data.choices[0]?.message?.reasoning_content;
 			const toolCalls = data.choices[0]?.message?.tool_calls;
+			const timings = data.timings;
 
 			let serializedToolCalls: string | undefined;
 
@@ -533,7 +534,7 @@ export class ChatService {
 				throw noResponseError;
 			}
 
-			onComplete?.(content, reasoningContent, undefined, serializedToolCalls);
+			onComplete?.(content, reasoningContent, timings, serializedToolCalls);
 
 			return content;
 		} catch (error) {

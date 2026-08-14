@@ -3,11 +3,13 @@
 #ifdef GGML_USE_RKNPU2
 
 #include "server-http.h"
+#include <nlohmann/json.hpp>
 #include <mutex>
 #include <condition_variable>
 #include <queue>
 #include <thread>
 #include <atomic>
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -45,6 +47,26 @@ struct rkllm_model_instance {
         std::atomic<bool> done{false};
         std::atomic<bool> error{false};
         std::atomic<bool> abort_requested{false};
+
+        struct metrics_snapshot {
+            int prompt_tokens = 0;
+            float prompt_ms = 0;
+            int generated_tokens = 0;
+            float generated_ms = 0;
+            bool has_perf = false;
+        };
+
+        // RKLLM only provides authoritative perf data in the finish callback.
+        // Keep a lightweight live estimate for timings_per_token streaming.
+        mutable std::mutex metrics_mtx;
+        int generated_tokens = 0;
+        bool generation_started = false;
+        std::chrono::steady_clock::time_point generation_started_at{};
+        metrics_snapshot perf;
+
+        void note_generated_token();
+        void set_perf(float prompt_ms, int prompt_tokens, float generated_ms, int generated_tokens);
+        metrics_snapshot get_metrics() const;
 
         void push(std::string && chunk) {
             { std::lock_guard<std::mutex> lk(mtx); chunks.push(std::move(chunk)); }
@@ -87,8 +109,11 @@ private:
     bool encode_image(const std::string & image_path, std::vector<float> & embed, int & n_tokens);
 
     static std::string sse_chunk(const std::string & model, const std::string & content, const std::string & finish_reason = "");
+    static std::string sse_chunk(const std::string & model, const std::string & content,
+                                 const std::string & finish_reason, const nlohmann::json & timings);
+    static std::string sse_usage_chunk(const std::string & model, const nlohmann::json & usage,
+                                       const nlohmann::json & timings);
     static std::string sse_done();
 };
 
 #endif // GGML_USE_RKNPU2
-

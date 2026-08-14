@@ -278,11 +278,22 @@ export interface ApiChatCompletionStreamChunk {
 		predicted_ms?: number;
 		cache_n?: number;
 	};
+	usage?: {
+		completion_tokens: number;
+		prompt_tokens: number;
+		total_tokens: number;
+	};
 	prompt_progress?: ChatMessagePromptProgress;
 }
 
 export interface ApiChatCompletionResponse {
 	model?: string;
+	usage?: {
+		completion_tokens: number;
+		prompt_tokens: number;
+		total_tokens: number;
+	};
+	timings?: ChatMessageTimings;
 	choices: Array<{
 		model?: string;
 		metadata?: { model?: string };

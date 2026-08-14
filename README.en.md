@@ -18,9 +18,20 @@ A fork of [rk-llama.cpp](https://github.com/invisiofficial/rk-llama.cpp) that ai
 | **OS** | Ubuntu 22.04 (modified from the image by Forlinx) |
 | **Build** | Native on-device with `gcc/g++ 11.4`, `cmake 3.22` |
 | **RKNN driver** | `0.9.6+` (NPU runtime `librknnrt.so`) |
-| **RKLLM runtime** | `1.2.3` (`librkllmrt.so`) |
+| **RKLLM runtime** | `1.2.3` (`main`) and `1.3.0` (`runtime-1.3.0`) |
 
-Other Rockchip SoCs (e.g. RK3576) and other RKNN/RKLLM versions are **not yet verified** (see TODO). The runtime libraries are vendored under `ggml/src/ggml-rknpu2/libs/`; for other versions, get the dynamic libraries from Rockchip's official repository.
+Other Rockchip SoCs (e.g. RK3576) and other RKNN/RKLLM versions are **not yet verified** (see TODO).
+
+#### RKLLM runtime and branch
+
+`.rkllm` models generally need the `rkllm-toolkit`/runtime version that produced them. The two branches ship matching headers, libraries, and service ABIs:
+
+| Branch | `librkllmrt.so` | Service ABI | Intended models |
+|---|---|---|---|
+| `main` | `1.2.3` | 1.2.3 | `.rkllm` models produced by toolkit 1.2.x |
+| `runtime-1.3.0` | `1.3.0` | 1.3.0 | `.rkllm` models produced by toolkit 1.3.x |
+
+Both ABIs support the RKLLM `usage/timings` implementation, but the binary must be built with the matching branch and header. Do not replace only the `.so` and keep a binary built for the other ABI. Use [`deploy/fetch-rkllm-runtime.sh`](./deploy/fetch-rkllm-runtime.sh) to inspect or switch runtimes; changing ABI requires a rebuild.
 
 ### Tested models
 
@@ -209,6 +220,8 @@ c = 2048
 
 The section name (`[my-gguf-model]`) becomes the model's ID in the API — name it whatever you like. Add as many sections as you want; `--models-max N` caps how many can be loaded at once.
 
+`models.ini` remains the source of model registration and runtime configuration. `/v1/models` is a read-only discovery view of models already registered in the INI; it does not replace the INI or create model entries. Put `tags` in each GGUF/RKLLM section when you want them shown in the WebUI or API.
+
 **INI key reference:**
 
 | Key | Meaning |
@@ -216,7 +229,7 @@ The section name (`[my-gguf-model]`) becomes the model's ID in the API — name 
 | `model` | Path to the model file (`.rkllm` or `.gguf`) |
 | `backend = rkllm` | Load in-process via `librkllmrt.so`. **Omit** for the GGUF / subprocess path. |
 | `mmproj` | RKLLM backend: path to the **`.rknn` vision encoder**. GGUF backend: the standard `mmproj-*.gguf` projector. Optional. |
-| `tags` | Optional comma-separated WebUI badges, e.g. `0.8B,rkllm,rknn`. These are informational only; fill them in per model. |
+| `tags` | Optional comma-separated WebUI/API tags shared by GGUF and RKLLM, e.g. `0.8B,gguf` or `0.8B,rkllm,rknn`; the server reads them from the INI and exposes them through `/v1/models`. |
 | `c` | Max context length (default 2048 for RKLLM) |
 | `load-on-startup` | `true` to **preload** this model when the server starts |
 | `jinja`, `reasoning` | Template / reasoning-format toggles |
@@ -338,9 +351,9 @@ This is an active edge-AI integration, not a finished product. Work in progress:
 
 - [ ] **Mixed RKNN vision encoder + GGUF LLM backbone** — the `tools/mtmd/rknn_encoder` path exists but needs integration testing so an RKNN encoder can feed a `.gguf` backbone (currently the encoder is wired to the RKLLM backbone only).
 - [ ] **Broader model support** — test more `.rkllm` LLM and `.rknn` vision-encoder combinations beyond the current Qwen / Gemma set.
-- [ ] **Driver / SDK version compatibility** — currently verified only on RKNN driver `0.9.6+` and RKLLM `1.2.3`. Test against older and newer RKNN / RKLLM releases and document the supported range.
+- [x] **Driver / SDK version compatibility** — compatibility code now covers the RKNN `0.9.6+` environment and both RKLLM 1.2.3/1.3.0 ABIs; more runtime versions still need hardware validation.
 - [ ] **RK3576 configuration** — fill in the stubbed device config in `ggml/src/ggml-rknpu2/`.
-- [ ] **RKLLM response metrics** — the RKLLM path currently does not expose OpenAI-compatible `usage` (prompt/completion token counts) or `timings` (latency/tokens per second). The SDK exposes `RKLLMPerfStat` through the result callback, but integrating it safely into both non-streaming and SSE responses needs further work; keep this out of the current release.
+- [x] **RKLLM response metrics** — the RKLLM path now exposes OpenAI-compatible `usage` and `timings`. Streaming uses live estimates and replaces them with the SDK's authoritative `RKLLMPerfStat` values at completion.
 
 ---
 

@@ -170,9 +170,18 @@ static int rkllm_result_callback(RKLLMResult * result, void * userdata, LLMCallS
     if (!ctx) return 0;
     switch (state) {
         case RKLLM_RUN_NORMAL:
-            if (result->text && result->text[0]) ctx->push(std::string(result->text));
+            if (result) {
+                // Use NORMAL callbacks as a live output estimate. The finish
+                // callback replaces this estimate with the SDK's exact value.
+                ctx->note_generated_token();
+                if (result->text && result->text[0]) ctx->push(std::string(result->text));
+            }
             break;
         case RKLLM_RUN_FINISH:
+            if (result) {
+                ctx->set_perf(result->perf.prefill_time_ms, result->perf.prefill_tokens,
+                              result->perf.generate_time_ms, result->perf.generate_tokens);
+            }
             ctx->done.store(true); ctx->cv.notify_all(); break;
         case RKLLM_RUN_ERROR:
             ctx->error.store(true); ctx->cv.notify_all(); break;
@@ -185,6 +194,11 @@ static int rkllm_result_callback(RKLLMResult * result, void * userdata, LLMCallS
 // ── SSE formatting ──
 
 std::string rkllm_model_instance::sse_chunk(const std::string & model, const std::string & content, const std::string & finish_reason) {
+    return sse_chunk(model, content, finish_reason, json(nullptr));
+}
+
+std::string rkllm_model_instance::sse_chunk(const std::string & model, const std::string & content,
+                                            const std::string & finish_reason, const json & timings) {
     json chunk = {
         {"object", "chat.completion.chunk"}, {"model", model},
         {"choices", json::array({{
@@ -192,10 +206,83 @@ std::string rkllm_model_instance::sse_chunk(const std::string & model, const std
             {"finish_reason", finish_reason.empty() ? json(nullptr) : json(finish_reason)},
         }})},
     };
+    if (!timings.is_null()) chunk["timings"] = timings;
+    return "data: " + chunk.dump() + "\n\n";
+}
+
+std::string rkllm_model_instance::sse_usage_chunk(const std::string & model, const json & usage, const json & timings) {
+    json chunk = {
+        {"object", "chat.completion.chunk"},
+        {"model", model},
+        {"choices", json::array()},
+        {"usage", usage},
+    };
+    if (!timings.is_null()) chunk["timings"] = timings;
     return "data: " + chunk.dump() + "\n\n";
 }
 
 std::string rkllm_model_instance::sse_done() { return "data: [DONE]\n\n"; }
+
+void rkllm_model_instance::stream_ctx::note_generated_token() {
+    std::lock_guard<std::mutex> lk(metrics_mtx);
+    if (!generation_started) {
+        generation_started = true;
+        generation_started_at = std::chrono::steady_clock::now();
+    }
+    ++generated_tokens;
+}
+
+void rkllm_model_instance::stream_ctx::set_perf(float prompt_ms, int prompt_tokens,
+                                                  float generated_ms, int generated_tokens) {
+    std::lock_guard<std::mutex> lk(metrics_mtx);
+    perf.prompt_ms = prompt_ms;
+    perf.prompt_tokens = prompt_tokens;
+    perf.generated_ms = generated_ms;
+    perf.generated_tokens = generated_tokens;
+    perf.has_perf = true;
+}
+
+rkllm_model_instance::stream_ctx::metrics_snapshot rkllm_model_instance::stream_ctx::get_metrics() const {
+    std::lock_guard<std::mutex> lk(metrics_mtx);
+    metrics_snapshot result = perf;
+    if (!result.has_perf) {
+        result.generated_tokens = generated_tokens;
+        if (generation_started) {
+            result.generated_ms = std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - generation_started_at).count();
+        }
+    }
+    return result;
+}
+
+static json rkllm_usage_json(const rkllm_model_instance::stream_ctx & ctx) {
+    const auto metrics = ctx.get_metrics();
+    return {
+        {"completion_tokens", metrics.generated_tokens},
+        {"prompt_tokens", metrics.prompt_tokens},
+        {"total_tokens", metrics.generated_tokens + metrics.prompt_tokens},
+        {"prompt_tokens_details", {{"cached_tokens", 0}}},
+    };
+}
+
+static json rkllm_timings_json(const rkllm_model_instance::stream_ctx & ctx) {
+    const auto metrics = ctx.get_metrics();
+    const double prompt_ms = metrics.prompt_ms;
+    const double generated_ms = metrics.generated_ms;
+    const int prompt_tokens = metrics.prompt_tokens;
+    const int generated_tokens = metrics.generated_tokens;
+    return {
+        {"cache_n", 0},
+        {"prompt_n", prompt_tokens},
+        {"prompt_ms", prompt_ms},
+        {"prompt_per_token_ms", prompt_tokens > 0 ? prompt_ms / prompt_tokens : 0.0},
+        {"prompt_per_second", prompt_ms > 0 ? 1000.0 * prompt_tokens / prompt_ms : 0.0},
+        {"predicted_n", generated_tokens},
+        {"predicted_ms", generated_ms},
+        {"predicted_per_token_ms", generated_tokens > 0 ? generated_ms / generated_tokens : 0.0},
+        {"predicted_per_second", generated_ms > 0 ? 1000.0 * generated_tokens / generated_ms : 0.0},
+    };
+}
 
 // ── Lifecycle ──
 
@@ -217,12 +304,16 @@ bool rkllm_model_instance::load(const std::string & model_path, int max_context_
     param.extend_param.embed_flash   = 1;
     param.extend_param.n_batch       = 1;
 
-    // rkllm_init takes an RKLLMCallback struct (SDK >= 1.3.0). Populate it
-    // with our result callback; the optional tokenizer/embed callbacks are
-    // left null (only needed for models without an internal tokenizer/embed layer).
+#if RKLLM_API_ABI_VERSION >= 130
+    // SDK 1.3.0 uses a callback structure; optional tokenizer/embed callbacks
+    // remain null because the deployed models have internal implementations.
     RKLLMCallback callback{};
     callback.result_callback = rkllm_result_callback;
     int ret = rkllm_init(&handle_, &param, &callback);
+#else
+    // SDK 1.2.3 uses the raw result callback ABI.
+    int ret = rkllm_init(&handle_, &param, rkllm_result_callback);
+#endif
     if (ret != 0) { RKLLM_LOG("rkllm_init failed ret=%d model=%s\n", ret, model_path.c_str()); return false; }
     loaded_ = true;
     RKLLM_INF("LLM loaded: %s\n", model_path.c_str());
@@ -296,8 +387,15 @@ server_http_res_ptr rkllm_model_instance::chat_completion(
 
     bool stream = body.value("stream", false);
 
-    // Extract max_tokens from request (default 512, matches init default)
-    int max_tokens = body.value("max_tokens", 512);
+    // Extract the OpenAI names for the generation limit. RKLLM otherwise uses
+    // the init-time value, which made max_tokens appear to be ignored.
+    int max_tokens = body.value("max_completion_tokens", body.value("max_tokens", 512));
+    if (max_tokens <= 0) max_tokens = 512;
+    const bool timings_per_token = body.value("timings_per_token", false);
+    bool include_usage = false;
+    if (body.contains("stream_options") && body["stream_options"].is_object()) {
+        include_usage = body["stream_options"].value("include_usage", false);
+    }
 
     // Extract prompt + image from messages
     std::string prompt;
@@ -410,6 +508,7 @@ server_http_res_ptr rkllm_model_instance::chat_completion(
         if (use_multimodal) {
             rkllm_input.input_type = RKLLM_INPUT_MULTIMODAL;
             rkllm_input.multimodal_input.prompt = (char *)prompt.c_str();
+#if RKLLM_API_ABI_VERSION >= 130
             rkllm_input.multimodal_input.image.image_embed = image_embed.data();
             rkllm_input.multimodal_input.image.n_image_tokens = n_image_tokens;
             rkllm_input.multimodal_input.image.n_image = 1;
@@ -418,6 +517,13 @@ server_http_res_ptr rkllm_model_instance::chat_completion(
             rkllm_input.multimodal_input.image.image_start   = (char *)"<image>";
             rkllm_input.multimodal_input.image.image_end     = (char *)"</image>";
             rkllm_input.multimodal_input.image.image_content = (char *)"<image>";
+#else
+            rkllm_input.multimodal_input.image_embed = image_embed.data();
+            rkllm_input.multimodal_input.n_image_tokens = n_image_tokens;
+            rkllm_input.multimodal_input.n_image = 1;
+            rkllm_input.multimodal_input.image_width = vision_width_;
+            rkllm_input.multimodal_input.image_height = vision_height_;
+#endif
         } else {
             rkllm_input.input_type = RKLLM_INPUT_PROMPT;
             rkllm_input.prompt_input = prompt.c_str();
@@ -427,8 +533,14 @@ server_http_res_ptr rkllm_model_instance::chat_completion(
         memset(&infer_params, 0, sizeof(RKLLMInferParam));
         infer_params.mode = RKLLM_INFER_GENERATE;
         infer_params.keep_history = 0;
+#if RKLLM_API_ABI_VERSION >= 130
+        infer_params.max_new_tokens = max_tokens;
+#endif
 
-        rkllm_run(handle_, &rkllm_input, &infer_params, &ctx);
+        if (rkllm_run(handle_, &rkllm_input, &infer_params, &ctx) != 0) {
+            ctx.error.store(true);
+            ctx.cv.notify_all();
+        }
     };
 
     // --- Non-streaming ---
@@ -448,6 +560,8 @@ server_http_res_ptr rkllm_model_instance::chat_completion(
                 {"message", {{"role", "assistant"}, {"content", full_output}}},
                 {"finish_reason", ctx.error.load() ? "error" : "stop"},
             }})},
+            {"usage", rkllm_usage_json(ctx)},
+            {"timings", rkllm_timings_json(ctx)},
         };
         res->data = response.dump();
         res->content_type = "application/json";
@@ -463,7 +577,7 @@ server_http_res_ptr rkllm_model_instance::chat_completion(
     int n_tokens_copy = n_image_tokens;
     bool multimodal_copy = use_multimodal;
 
-    worker_ = std::thread([this, prompt, role, embed_ptr, n_tokens_copy, multimodal_copy, ctx]() {
+    worker_ = std::thread([this, prompt, role, embed_ptr, n_tokens_copy, multimodal_copy, max_tokens, ctx]() {
         std::lock_guard<std::mutex> lk(mutex_);
 
         RKLLMInput rkllm_input;
@@ -474,6 +588,7 @@ server_http_res_ptr rkllm_model_instance::chat_completion(
         if (multimodal_copy) {
             rkllm_input.input_type = RKLLM_INPUT_MULTIMODAL;
             rkllm_input.multimodal_input.prompt = (char *)prompt.c_str();
+#if RKLLM_API_ABI_VERSION >= 130
             rkllm_input.multimodal_input.image.image_embed = embed_ptr->data();
             rkllm_input.multimodal_input.image.n_image_tokens = n_tokens_copy;
             rkllm_input.multimodal_input.image.n_image = 1;
@@ -482,6 +597,13 @@ server_http_res_ptr rkllm_model_instance::chat_completion(
             rkllm_input.multimodal_input.image.image_start   = (char *)"<image>";
             rkllm_input.multimodal_input.image.image_end     = (char *)"</image>";
             rkllm_input.multimodal_input.image.image_content = (char *)"<image>";
+#else
+            rkllm_input.multimodal_input.image_embed = embed_ptr->data();
+            rkllm_input.multimodal_input.n_image_tokens = n_tokens_copy;
+            rkllm_input.multimodal_input.n_image = 1;
+            rkllm_input.multimodal_input.image_width = vision_width_;
+            rkllm_input.multimodal_input.image_height = vision_height_;
+#endif
         } else {
             rkllm_input.input_type = RKLLM_INPUT_PROMPT;
             rkllm_input.prompt_input = prompt.c_str();
@@ -491,8 +613,14 @@ server_http_res_ptr rkllm_model_instance::chat_completion(
         memset(&infer_params, 0, sizeof(RKLLMInferParam));
         infer_params.mode = RKLLM_INFER_GENERATE;
         infer_params.keep_history = 0;
+#if RKLLM_API_ABI_VERSION >= 130
+        infer_params.max_new_tokens = max_tokens;
+#endif
 
-        rkllm_run(handle_, &rkllm_input, &infer_params, ctx.get());
+        if (rkllm_run(handle_, &rkllm_input, &infer_params, ctx.get()) != 0) {
+            ctx->error.store(true);
+            ctx->cv.notify_all();
+        }
         ctx->done.store(true);
         ctx->cv.notify_all();
     });
@@ -501,16 +629,26 @@ server_http_res_ptr rkllm_model_instance::chat_completion(
     auto name = model_name_;
     auto * self = this;
     res->content_type = "text/event-stream";
-    res->next = [ctx, name, stop_fn, self](std::string & chunk) -> bool {
+    res->next = [ctx, name, stop_fn, self, timings_per_token, include_usage](std::string & chunk) -> bool {
         if (stop_fn()) {
             ctx->abort_requested.store(true);
             self->abort_inference();
-            chunk = sse_chunk(name, "", "stop") + sse_done();
+            const json timings = rkllm_timings_json(*ctx);
+            chunk = sse_chunk(name, "", "stop", include_usage ? json(nullptr) : timings);
+            if (include_usage) chunk += sse_usage_chunk(name, rkllm_usage_json(*ctx), timings);
+            chunk += sse_done();
             return false;
         }
-        if (ctx->pop(chunk, 500)) { chunk = sse_chunk(name, chunk); return true; }
+        if (ctx->pop(chunk, 500)) {
+            chunk = sse_chunk(name, chunk, "", timings_per_token ? rkllm_timings_json(*ctx) : json(nullptr));
+            return true;
+        }
         if (ctx->done.load() || ctx->error.load()) {
-            chunk = sse_chunk(name, "", ctx->error.load() ? "error" : "stop") + sse_done();
+            const json timings = rkllm_timings_json(*ctx);
+            chunk = sse_chunk(name, "", ctx->error.load() ? "error" : "stop",
+                              include_usage ? json(nullptr) : timings);
+            if (include_usage) chunk += sse_usage_chunk(name, rkllm_usage_json(*ctx), timings);
+            chunk += sse_done();
             if (self->worker_.joinable()) self->worker_.join();
             return false;
         }
